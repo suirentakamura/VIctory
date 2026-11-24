@@ -6,8 +6,9 @@ wave also run in the console flow: masks read whole, lanes of the other
 half, divergent branches and loops, LDS shared in the console's
 instruction order, and (in groups of exactly 64 threads) whole-wave integer
 reductions and prefix sums. Still open: groups of several console waves,
-whole-wave sections in other groups or of floats, and `ds_(b)permute`; each
-stops with its own reason.
+whole-wave sections in other groups or of floats, and `ds_permute`; each
+stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
+and is lowered as an in-half read, like `ds_swizzle`.)
 
 ## The problem
 
@@ -77,7 +78,8 @@ wave's first lane.)
 | `v_mbcnt_lo` in the upper half | the lower half's ballot |
 | `v_readlane`, `v_readfirstlane` (uniform lane) | the value of lane `l & 31` from the half that owns `l` |
 | `v_writelane` to the other half | the value and lane |
-| `ds_bpermute`, `ds_permute` | open: check whether GFX10 wave64 crosses halves for these, then 32 words per half if it does |
+| `ds_bpermute` | nothing: on GFX10 a wave64's backward permute gathers within each 32-lane half (AMD's RDNA 2 ISA reference, as cited by the lowering's contributor; not checked on console hardware), so it is an in-half read |
+| `ds_permute` | open: check whether GFX10 wave64 crosses halves for it, then 32 words per half if it does |
 
 A mask read only lane by lane (a `v_cndmask` selector, a carry-in) needs
 just the lane's own half. Exchanging those anyway is correct but slow.
@@ -119,7 +121,7 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no `ds_(b)permute`, and whole-wave
+waves, at most 64 threads per group, no `ds_permute`, and whole-wave
 sections only in a group of exactly 64 threads.
 
 **LDS.** The console runs an instruction in all 64 lanes before the next,
@@ -165,7 +167,7 @@ lanes below 20 take never wrote lane 40.
 
 Such compute programs now ask for the console flow on every host (the
 second case of `CONSOLE_FLOW`): a program with `v_readlane` or
-`v_writelane`, at least one branch that is not uniform, no `ds_(b)permute`
+`v_writelane`, at least one branch that is not uniform, no `ds_permute`
 and no whole-wave sections. On a host that runs the console's wave size,
 one host wave is the console wave, so ballots are the wave's own and nothing
 is exchanged; any group size and LDS are fine. If the console flow cannot

@@ -479,7 +479,9 @@ impl<'a> Lower<'a> {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
-                } else if insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32") {
+                } else if insts()
+                    .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
+                {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
                 } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
@@ -2328,7 +2330,8 @@ impl<'a> Lower<'a> {
             // RDNA2 gathers separately within each 32-lane half. Disabled
             // source lanes supply zero and disabled destinations are preserved.
             self.cross_lane(false)?;
-            let address = self.vgprs(inst, addr.as_ref().ok_or("a backward permute address")?, 1)?[0];
+            let address =
+                self.vgprs(inst, addr.as_ref().ok_or("a backward permute address")?, 1)?[0];
             let source = self.vgprs(inst, data.first().ok_or("a backward permute source")?, 1)?[0];
             let offset = self.s.m.i32(u32::from(*offset0));
             let byte_address = self.s.m.bin(c, Bin::Add, address, offset);
@@ -2336,14 +2339,26 @@ impl<'a> Lower<'a> {
             let word = self.s.m.bin(c, Bin::LShr, byte_address, two);
             let mask = self.s.m.i32(31);
             let within_half = self.s.m.bin(c, Bin::And, word, mask);
-            let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+            let lane = self.s.op(
+                c,
+                "waveGetLaneIndex",
+                Attr::ReadOnly,
+                self.s.t.i32,
+                111,
+                &[],
+            );
             let high_mask = self.s.m.i32(!31);
             let base = self.s.m.bin(c, Bin::And, lane, high_mask);
             let index = self.s.m.bin(c, Bin::Or, base, within_half);
 
             let active = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let ty = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
-            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, ty, 116, &[active]);
+            let ty = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, ty, 116, &[active]);
             let lo = self.s.m.extract(c, ballot, 0);
             let hi = self.s.m.extract(c, ballot, 1);
             let zero = self.s.m.i32(0);
@@ -2355,7 +2370,12 @@ impl<'a> Lower<'a> {
             let enabled = self.s.m.cmp(c, pred::NE, bit, zero);
             let gathered = self.read_lane(source, index);
             let value = self.s.m.select(c, enabled, gathered, zero);
-            self.write(inst, Reg::V(dst_reg.ok_or("a backward permute result")?), value, guard);
+            self.write(
+                inst,
+                Reg::V(dst_reg.ok_or("a backward permute result")?),
+                value,
+                guard,
+            );
             return Ok(());
         }
         if name == "ds_swizzle_b32" {
