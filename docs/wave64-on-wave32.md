@@ -3,9 +3,11 @@
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops, and LDS shared in the console's
-instruction order. Still open: groups of several console waves, whole-wave
-sections and `ds_(b)permute`; each stops with its own reason.
+half, divergent branches and loops, LDS shared in the console's
+instruction order, and (in groups of exactly 64 threads) whole-wave integer
+reductions and prefix sums. Still open: groups of several console waves,
+whole-wave sections in other groups or of floats, and `ds_(b)permute`; each
+stops with its own reason.
 
 ## The problem
 
@@ -117,8 +119,8 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no `ds_(b)permute`, and no
-whole-wave sections.
+waves, at most 64 threads per group, no `ds_(b)permute`, and whole-wave
+sections only in a group of exactly 64 threads.
 
 **LDS.** The console runs an instruction in all 64 lanes before the next,
 so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
@@ -131,9 +133,19 @@ Two testers' counts on the title put those first: 120 of the 223 programs
 without the barrier too (that card keeps the two waves in step), so they
 check the result, not the need for the barrier.
 
+**Whole-wave sections** (contributed by Raxstreams). A section stays
+recognised as it is (`emit::wave`), and only what it leaves crosses the
+halves, where the section is lowered: each half's reduction is exchanged
+and the two are combined with the section's own operation (sum, and, or,
+xor, minimum, maximum of integers); a prefix sum in the upper half adds the
+lower half's total. Only in a group of exactly 64 threads, so both halves
+are whole. Float reductions stop: a float sum would change its order, and
+minimum and maximum, which would stay exact, are not done yet. A title run
+on #439 put these next: 24 of the 45 programs the stack still stopped.
+
 What still stops says why: `console wave64 lanes in a group of more than 64
-threads`, `ds_permute across the halves`, or `a whole-wave section`, each
-`on a host without 64-lane waves`.
+threads`, `ds_permute across the halves`, or `a whole-wave section` (in
+other groups), each `on a host without 64-lane waves`.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
