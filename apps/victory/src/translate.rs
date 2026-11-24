@@ -501,7 +501,13 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            // With what the module declares and calls: the validator's
+            // message for an operation the stage or the entry's properties
+            // do not allow names neither.
+            t.fail(
+                format!("validator: {first} [{}]", emit::last_module_summary()),
+                label,
+            );
         }
     }
 }

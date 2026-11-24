@@ -498,3 +498,33 @@ fn lds_order_holds_when_one_half_is_busy() {
         true,
     );
 }
+
+/// The diagnostic summary of the module emitted last: what it declares and
+/// the operations it calls, nothing of the console program.
+#[test]
+fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let mut p = program(&body, 64);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.threads = [8, 8, 1];
+    emit_for(&p, nvidia).unwrap();
+    let summary = super::last_module_summary();
+    eprintln!("{summary}");
+    assert!(
+        summary.starts_with("threads 8x8x1, wave size 32; ops: "),
+        "{summary}"
+    );
+    for op in ["barrier", "waveReadLaneAt", "flattenedThreadIdInGroup"] {
+        assert!(summary.contains(op), "{op} in {summary}");
+    }
+}

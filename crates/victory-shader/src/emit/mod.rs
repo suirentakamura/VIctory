@@ -228,6 +228,13 @@ impl Default for Target {
     }
 }
 
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, for any host ([`Target::ANY`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
