@@ -98,6 +98,30 @@ impl Host {
         }
     }
 
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
