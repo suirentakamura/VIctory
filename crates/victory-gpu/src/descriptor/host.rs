@@ -481,7 +481,7 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
-    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// of `buffer` from byte `offset` (a multiple of 4; see `State::root_srv_table`): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
@@ -509,7 +509,7 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
-    /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a root
+    /// `len` bytes of `buffer` from byte `offset` (a multiple of 4): a root
     /// UAV with a size, whose accesses past it read zeros and drop writes.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };

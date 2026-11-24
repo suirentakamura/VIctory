@@ -683,14 +683,28 @@ impl State {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) && uav {
+                        // D3D12 asks raw views to start on 16 bytes; the
+                        // title's root views need only 4 (a dword). On
+                        // vkd3d-proton a raw view is a storage buffer, which
+                        // RADV and NVIDIA place on 4 bytes, so the view
+                        // starts where the title's does. A null one would
+                        // read zeros and drop writes, and a program waiting
+                        // on what it writes there never ends (play22).
+                        if !offset.is_multiple_of(16) {
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                uav,
+                                "a root view not on 16 bytes: a raw view at its dword"
+                            );
+                        }
+                        if offset.is_multiple_of(4) && uav {
                             host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
-                        } else if offset.is_multiple_of(16) {
+                        } else if offset.is_multiple_of(4) {
                             host.raw_at(index, &s.buffer, offset, s.left(*a));
                         } else if uav {
                             once!(
                                 address = format_args!("{a:#x}"),
-                                "a root UAV not on 16 bytes reads zeros and drops writes"
+                                "a root UAV not on 4 bytes reads zeros and drops writes"
                             );
                             host.null_raw_uav_at(index);
                         } else {
@@ -698,7 +712,7 @@ impl State {
                             // aligned start would shift every read.
                             once!(
                                 address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
+                                "a root SRV not on 4 bytes reads zeros"
                             );
                             host.null_raw_at(index);
                         }
