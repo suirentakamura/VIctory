@@ -114,6 +114,12 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                // Local tool (not upstream): keep every container.
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_ALL") {
+                    let path = std::path::Path::new(&dir)
+                        .join(format!("{}-{}.dxbc", self.stage, self.hash));
+                    let _ = std::fs::write(path, &self.container);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
