@@ -4403,10 +4403,12 @@ impl<'a> Lower<'a> {
                 };
                 // A selector that derives from neither EXEC nor a compare
                 // (a constant, a number built from scalars) is a mask held as
-                // a number: with console lanes the lane tests its own bit.
+                // a number. The in-half form cannot test the high word, so
+                // defer the select there and retry only if its result is used.
+                let numeric_mask = self.console_lanes && (!self.split || self.console_cf);
                 let m = mask
                     .and_then(|m| {
-                        let others = self.console_lanes.then(|| self.x.st.others.get(&m));
+                        let others = numeric_mask.then(|| self.x.st.others.get(&m));
                         self.x.st.masks.get(&m).or(others.flatten()).copied()
                     })
                     .ok_or(UNTRACKED_SELECT)?;

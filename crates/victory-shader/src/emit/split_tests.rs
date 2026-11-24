@@ -1005,6 +1005,43 @@ fn selects_on_masks_held_as_numbers() {
     }
 }
 
+#[test]
+fn numeric_selects_beside_in_half_reads() {
+    let mut body = IN_HALF.to_vec();
+    body.extend([
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_03C1, // s_mov_b32 s11, -1
+    ]);
+    let select = body.len();
+    body.extend([
+        0xD501_0001,
+        0x0029_0F02, // v_cndmask_b32 v1, v2, 7, s[10:11] (unused)
+    ]);
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let unused = program(&body, 128);
+    let shader = emit_for(&unused, wave32).unwrap();
+    assert_eq!(wave_size(&shader.dxil), Some(32));
+    program_case(
+        "unused numeric select beside in-half reads",
+        &unused,
+        |t| t ^ 31,
+        true,
+    );
+
+    body[select] = 0xD501_0002; // write v2, the stored result
+    let used = program(&body, 64);
+    assert!(emit_for(&used, wave32).is_ok());
+    program_case(
+        "used numeric select beside in-half reads",
+        &used,
+        |t| if t < 32 { t ^ 31 } else { 7 },
+        true,
+    );
+}
+
 /// A lane read inside a divergent branch in a program that also has a
 /// whole-wave section: the lane read takes the console flow on every host,
 /// and the section is lowered there as it is elsewhere. Lanes below 20
