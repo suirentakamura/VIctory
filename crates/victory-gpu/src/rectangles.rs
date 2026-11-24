@@ -32,9 +32,14 @@
 //! [`crate::primitive::components`] and components past the vertex stride
 //! keep the first vertex's bytes. A pipeline without per-vertex inputs (one
 //! that builds its corners from the vertex id) gets `6 * rects` vertices from
-//! 0, as a direct draw does. Vertex strides not a multiple of 4 are padded up
-//! to 4 bytes in the scratch (and bound with that stride), so threads never
-//! share a 32-bit word across vertices.
+//! 0, as a direct draw does. With inputs, the vertex id is the expanded one
+//! from the allocated start, whose order between records may change from run
+//! to run. Vertex strides not a multiple of 4 are padded up to 4 bytes in the
+//! scratch (and bound with that stride), so threads never share a 32-bit word
+//! across vertices.
+//!
+//! The rewrite pass bounds counts and instances itself, as the clamp does, so
+//! it stays safe whether or not the clamp writes its results back in place.
 
 use std::sync::Arc;
 
@@ -240,6 +245,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
     uint4 rec = src_args.Load4(r * src_stride);
+    // The clamp's bounds again: 2^24 vertices, 2^26 vertex instances.
+    rec.x = min(rec.x, 1u << 24);
+    rec.y = min(rec.y, (1u << 26) / max(rec.x, 1u));
     uint rects = rec.x / 3u;
     uint src_verts = rects * 3u;
     uint out_verts = rects * 6u;
@@ -383,7 +391,9 @@ uint f32_to_half(float v) {
     uint man = bits & 0x7fffffu;
     if (ex >= 31) return sgn | 0x7c00u;
     if (ex <= 0) return sgn;
-    return sgn | ((uint)ex << 10u) | ((man + 0x1000u) >> 13u);
+    // Added, not or-ed: a rounding carry out of the mantissa raises the
+    // exponent (as #260 does for primitive.rs).
+    return sgn | (((uint)ex << 10u) + ((man + 0x1000u) >> 13u));
 }
 
 float read_comp(uint kind, uint pos) {
