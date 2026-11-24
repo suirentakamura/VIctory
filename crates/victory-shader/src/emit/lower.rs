@@ -3678,7 +3678,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err("a scalar memory read as data without a scalar destination");
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3686,7 +3686,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("a scalar memory read as data of another kind"),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -3740,7 +3740,19 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // A buffer descriptor also read by `s_buffer_load`: a raw SRV
+            // has a size (a constant buffer view does not).
+            Fields::Smem { .. } => match used.map(|u| u.kind) {
+                Some(ResourceType::Srv) => ((11 | u, 0), None),
+                Some(ResourceType::Cbv) => {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a descriptor read as data and by a scalar load"),
+            },
+            Fields::Flat { .. } => {
+                return Err("a descriptor read as data and by a global access");
+            }
+            _ => return Err("a descriptor read as data and by another instruction"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -6649,9 +6661,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -6680,18 +6689,35 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // The address layout of a sample or gather: extra words (texel
+        // offsets, bias, comparison value) first, then explicit gradients
+        // (x then y), then the coordinates and a level or clamp.
+        let sampling = name.starts_with("image_sample") || name.starts_with("image_gather");
+        let extras = if sampling {
+            usize::from(name.ends_with("_o"))
+                + usize::from(name == "image_sample_b")
+                + usize::from(
+                    name.starts_with("image_sample_c") || name.starts_with("image_gather4_c"),
+                )
+        } else {
+            0
+        };
+        let spatial = coords - usize::from(kind == 6 || kind == 7);
+        let grads = if name.starts_with("image_sample_d") {
+            2 * spatial
+        } else {
+            0
+        };
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let (dword, half) = image_address_place(k, extras, grads, *a16);
+            let r = *regs.get(dword).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            let Some(half) = half else {
                 return Ok(x);
-            }
+            };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -6840,10 +6866,12 @@ impl<'a> Lower<'a> {
         }
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" => (60, true),
-            "image_sample_lz" | "image_sample_l" => (62, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
+                (62, true)
+            }
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -6908,12 +6936,9 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
-            // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
-            let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // The extra words and gradients, as laid out above.
+            let first = extras;
+            debug_assert_eq!(grads, if op == 63 { 2 * spatial } else { 0 });
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -6980,6 +7005,24 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            if offset_word && op != 73 {
+                // A sample's offsets are immediates on the host: the word
+                // must be a constant, each 6-bit offset within -8..7.
+                let w = addr_val(self, 0)?;
+                let bits = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("an image sample with a computed texel offset")?;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let v = ((bits as u32) >> (8 * k) & 0x3F) as i32;
+                    let v = (v << 26) >> 26;
+                    if !(-8..=7).contains(&v) {
+                        return Err("an image sample with a texel offset beyond -8..7");
+                    }
+                    *o = self.s.m.i32(v as u32);
+                }
+            }
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
@@ -7009,8 +7052,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
+                    // With a16 the bias is an f16 in its word's low half.
                     let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -7032,7 +7076,15 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    // `_cl`: the level-of-detail clamp follows the
+                    // coordinates.
+                    let clamp = if name == "image_sample_d_cl" {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7057,8 +7109,8 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                    let lod = if name.starts_with("image_sample_l_") || name == "image_sample_l" {
+                        let x = addr_val(self, first + coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -8400,12 +8452,79 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+/// Where address `k` of an image instruction is: its VGPR among the
+/// address VGPRs and, with `a16`, which 16-bit half (`None`: the whole
+/// word). Addresses are numbered extra words (texel offsets, bias,
+/// comparison value) first, then `grads` explicit gradients (x then y),
+/// then the coordinates and a level or clamp. Without `a16` each is a VGPR.
+/// With it, as the hardware packs them (and `image_addr_dwords` counts):
+/// each extra word takes a whole VGPR (a 16-bit bias in its low half), the
+/// gradients pack in pairs with each direction of an odd count padded to
+/// whole VGPRs, and the coordinates begin a new VGPR.
+fn image_address_place(k: usize, extras: usize, grads: usize, a16: bool) -> (usize, Option<u32>) {
+    if !a16 || k < extras {
+        return (k, None);
+    }
+    let per = grads / 2;
+    let g = k - extras;
+    if g < grads {
+        let (group, within) = (g / per, g % per);
+        return (
+            extras + group * per.div_ceil(2) + within / 2,
+            Some(within as u32 % 2),
+        );
+    }
+    let r = g - grads;
+    (extras + 2 * per.div_ceil(2) + r / 2, Some(r as u32 % 2))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, image_address_place, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
+
+    #[test]
+    fn a16_image_addresses_pack_as_the_hardware_does() {
+        // 32-bit: one VGPR each, in order.
+        assert_eq!(image_address_place(3, 1, 4, false), (3, None));
+        // A biased 2D sample (or a gather with an offset word): the extra
+        // word alone in VGPR 0, then (u, v) in 1.
+        assert_eq!(image_address_place(0, 1, 0, true), (0, None));
+        assert_eq!(image_address_place(1, 1, 0, true), (1, Some(0)));
+        assert_eq!(image_address_place(2, 1, 0, true), (1, Some(1)));
+        // 2D gradients: (dx.x, dx.y) (dy.x, dy.y) (u, v) (clamp).
+        let at: Vec<_> = (0..7).map(|k| image_address_place(k, 0, 4, true)).collect();
+        assert_eq!(
+            at,
+            [
+                (0, Some(0)),
+                (0, Some(1)),
+                (1, Some(0)),
+                (1, Some(1)),
+                (2, Some(0)),
+                (2, Some(1)),
+                (3, Some(0)),
+            ]
+        );
+        // 3D gradients: each direction of three padded to two VGPRs.
+        let at: Vec<_> = (0..9).map(|k| image_address_place(k, 0, 6, true)).collect();
+        assert_eq!(
+            at,
+            [
+                (0, Some(0)),
+                (0, Some(1)),
+                (1, Some(0)),
+                (2, Some(0)),
+                (2, Some(1)),
+                (3, Some(0)),
+                (4, Some(0)),
+                (4, Some(1)),
+                (5, Some(0)),
+            ]
+        );
+    }
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -8839,6 +8958,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: super::super::Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
             #[cfg(windows)]
@@ -9031,6 +9153,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
 

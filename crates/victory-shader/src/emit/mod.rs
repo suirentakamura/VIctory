@@ -85,6 +85,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
 mod sampler;
@@ -755,10 +757,10 @@ mod tests {
                 code: words(case).iter().flat_map(|w| w.to_le_bytes()).collect(),
             };
             let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res, Target::ANY);
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
                 assert!(
@@ -1244,7 +1246,7 @@ mod barycentric_tests {
         let st = structure::structure(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
