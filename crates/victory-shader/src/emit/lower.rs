@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -321,6 +321,40 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
+}
+
+/// The scalar instruction defining an SSA value in this block and its operands.
+fn scalar_def<'a, const N: usize>(
+    block: &'a Block,
+    value: Value,
+    op: &str,
+) -> Option<(&'a Inst, [Operand; N])> {
+    let inst = block
+        .insts
+        .iter()
+        .find(|i| i.writes.iter().any(|w| w.1 == value))?;
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    (inst.name() == op).then_some((inst, src.as_slice().try_into().ok()?))
+}
+
+fn sgpr_operand(inst: &Inst, operand: Operand) -> Option<Value> {
+    match operand {
+        Operand::Scalar {
+            code: code @ 0..=101,
+            dwords: 1,
+        } => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+fn scalar_constant(operand: Operand) -> Option<u32> {
+    match operand {
+        Operand::Const(code) => crate::resource::inline(code),
+        Operand::Literal(value) => Some(value),
+        _ => None,
+    }
 }
 
 impl<'a> Lower<'a> {
@@ -6506,6 +6540,171 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// An unguarded indexed write replaces the incoming value before a
+    /// consumer can observe it, either on this edge or in a counted loop.
+    fn overwritten_movreld_edge(&self, b: usize, phi: &Phi, edge: usize) -> Option<()> {
+        let Reg::V(reg) = phi.reg else { return None };
+        let p = self.x.p;
+        let block = &p.blocks[b];
+        if self.sections.contains_key(&b)
+            || self.sections.contains_key(&block.preds[edge])
+            || p.blocks
+                .iter()
+                .flat_map(|bb| &bb.phis)
+                .any(|ph| ph.args.contains(&phi.value))
+        {
+            return None;
+        }
+        let mut uses = p.blocks.iter().enumerate().flat_map(|(bb, block)| {
+            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                inst.reads
+                    .iter()
+                    .any(|r| r.1 == phi.value)
+                    .then_some((bb, i, inst))
+            })
+        });
+        let (bb, i, mov) = uses.next()?;
+        if uses.next().is_some()
+            || bb != b
+            || self.x.st.guards[b][i].is_some()
+            || mov.name() != "v_movreld_b32"
+            || mov.read(phi.reg) != Some(phi.value)
+        {
+            return None;
+        }
+        let Fields::Valu(v) = &mov.fields else {
+            return None;
+        };
+        let (
+            Some(Operand::Vector {
+                reg: base,
+                dwords: 1,
+            }),
+            [
+                Operand::Vector {
+                    reg: src,
+                    dwords: 1,
+                },
+            ],
+        ) = (v.dst, v.src.as_slice())
+        else {
+            return None;
+        };
+        if v.dpp.is_some()
+            || v.sdwa.is_some()
+            || mov.read(Reg::V(*src))? == phi.value
+            || mov.write(phi.reg).is_none()
+        {
+            return None;
+        }
+        let index = u32::from(reg.checked_sub(base)?);
+        // Follow M0 to a copy of a scalar phi in this block, then the
+        // constant written on the corresponding predecessor.
+        let (copy, [src]) = scalar_def(block, mov.read(Reg::S(crate::ir::M0))?, "s_mov_b32")?;
+        let scalar = sgpr_operand(copy, src)?;
+        let index_phi = block.phis.iter().find(|ph| ph.value == scalar)?;
+        let (_, [initial]) = scalar_def(
+            &p.blocks[block.preds[edge]],
+            index_phi.args[edge],
+            "s_mov_b32",
+        )?;
+        let known = scalar_constant(initial)?;
+        if index == known {
+            return Some(());
+        }
+        if index < known {
+            return None; // Reaching this slot would require the index to wrap.
+        }
+        self.counted_movreld_index(b, edge, phi, index_phi, mov, index)
+    }
+
+    /// An unguarded move fills one more register on every iteration.
+    /// Values from before the loop can only survive in slots the index skips.
+    fn counted_movreld_index(
+        &self,
+        b: usize,
+        edge: usize,
+        phi: &Phi,
+        indices: &Phi,
+        mov: &Inst,
+        slot: u32,
+    ) -> Option<()> {
+        let p = self.x.p;
+        let st = self.x.st;
+        let block = &p.blocks[b];
+        let LaneExit::Branch {
+            when,
+            taken: latch,
+            not_taken: exit,
+        } = st.exits[b]
+        else {
+            return None;
+        };
+        let back = block.preds.iter().position(|&q| q == latch)?;
+        if block.preds.len() != 2
+            || back == edge
+            || b == latch
+            || b == exit
+            || exit == latch
+            || self.sections.contains_key(&latch)
+            || st.exits[latch] != LaneExit::Jump(b)
+            || p.blocks[latch].preds != [b]
+            || p.blocks[exit].preds != [b]
+            || st.exits[exit] != LaneExit::End
+            || self.rpo[b] >= self.rpo[latch]
+            || self.rpo[block.preds[edge]] >= self.rpo[b]
+        {
+            return None;
+        }
+        // The indexed result may only go around the loop as its own old
+        // value or be consumed in the normal exit block.
+        let result = mov.write(phi.reg)?;
+        if phi.args[back] != result {
+            return None;
+        }
+        for (bb, block) in p.blocks.iter().enumerate() {
+            if bb != exit
+                && block
+                    .insts
+                    .iter()
+                    .any(|inst| inst.reads.iter().any(|r| r.1 == result))
+            {
+                return None;
+            }
+            if block.phis.iter().any(|other| {
+                other
+                    .args
+                    .iter()
+                    .enumerate()
+                    .any(|(n, &arg)| arg == result && (other.value != phi.value || n != back))
+            }) {
+                return None;
+            }
+        }
+        // Follow the latch copy to the unit increment, then require that
+        // this very increment is compared for equality to the exit bound.
+        let (copy, [src]) = scalar_def(&p.blocks[latch], indices.args[back], "s_mov_b32")?;
+        let next = sgpr_operand(copy, src)?;
+        let (increment, [from, step]) = scalar_def(block, next, "s_add_i32")?;
+        if sgpr_operand(increment, from)? != indices.value || scalar_constant(step)? != 1 {
+            return None;
+        }
+        let (Atom::Uniform(scc), Bool::TRUE, Bool::FALSE) = st.bools.node(when)? else {
+            return None;
+        };
+        let branch = block.insts.last()?;
+        if branch.name() != "s_cbranch_scc0" || branch.read(Reg::Scc) != Some(scc) {
+            return None;
+        }
+        let (cmp, [tested, bound]) = scalar_def(block, scc, "s_cmp_eq_u32")?;
+        if sgpr_operand(cmp, tested)? != next {
+            return None;
+        }
+        let limit = scalar_constant(bound)?;
+        // The initial index is below this slot. The loop must pass it before exit.
+        (slot < limit).then_some(())
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
@@ -6518,6 +6717,12 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Missing("barycentrics read directly")), false)
+                        if self.read_phis.contains(&phi.value)
+                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
