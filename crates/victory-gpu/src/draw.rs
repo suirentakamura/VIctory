@@ -404,6 +404,8 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            #[cfg(feature = "diagnostics")]
+            crate::producers::live_target(t);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
@@ -459,6 +461,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::producers::set_reader(&p.name);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -605,6 +609,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.note_dropped_writes();
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -614,7 +619,10 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                self.note_dropped_writes();
+            }
             return;
         };
         if !p.compute {
@@ -690,6 +698,41 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
+        }
+    }
+
+    /// Diagnostics (`VICTORY_PRODUCERS=1`): what the dropped draw or
+    /// dispatch bound now would have written, for [`crate::producers`].
+    #[cfg(feature = "diagnostics")]
+    fn note_dropped_writes(&self) {
+        if !crate::producers::on() {
+            return;
+        }
+        let mut writer = String::new();
+        for (stage, hash, used) in crate::pipeline::native_used(self.pipeline as This) {
+            let compute = stage == "compute";
+            if writer.is_empty() || stage == "pixel" || compute {
+                writer = format!("{stage} {hash}");
+            }
+            for u in used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(view) = crate::descriptor::view(handle) {
+                    crate::producers::dropped_write(&format!("{stage} {hash}"), &view);
+                }
+            }
+        }
+        if !writer.starts_with("compute") {
+            for &t in &self.targets {
+                crate::producers::dropped_target(&writer, t);
+            }
         }
     }
 
@@ -949,6 +992,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 
@@ -1036,6 +1081,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 }
@@ -1058,6 +1105,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            self.note_dropped_writes();
             return false;
         }
         const DRAW: u32 = 0;
@@ -1114,8 +1162,14 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                None => {
+                    crate::pipeline::note_drop(self.pipeline as This);
+                    self.note_dropped_writes();
+                }
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
@@ -1186,6 +1240,12 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
+    #[cfg(feature = "diagnostics")]
+    if u.kind == ResourceType::Uav {
+        crate::producers::live_write(view);
+    } else {
+        crate::producers::read(view);
+    }
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);

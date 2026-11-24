@@ -272,8 +272,25 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn() + crate::draw::dispatched();
+        crate::capture::note_busy(frame, now - LAST.swap(now, Ordering::Relaxed));
+    }
+    // Show mode (diagnostics builds) picks its target before a dump takes
+    // the frame's list.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let shown = crate::capture::shown(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
+        let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+        if host.present(&copy.texture, state, frame).is_some() {
+            return S_OK;
+        }
     }
     #[cfg(windows)]
     if planes > 0
