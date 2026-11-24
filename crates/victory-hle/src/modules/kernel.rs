@@ -42,8 +42,27 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
 /// them (zeroed, as fresh pages are).
 pub extern "system" fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
     use windows_sys::Win32::System::Memory::MEM_COMMIT;
+    use windows_sys::Win32::System::Memory::MEM_RESERVE;
     if !address.is_null() && kind & MEM_COMMIT != 0 {
         victory_gpu::uma::title_commit(address as usize, size);
+    }
+    // New reservations are write-watched, as `XMemVirtualAlloc`'s are: the
+    // GPU side's copies of title memory then learn which pages the title
+    // wrote by asking the kernel (cached for the frame), instead of guarding
+    // the range again after every copy (play51: the title's biggest GPU
+    // buffer, 174 MB, comes from plain `VirtualAlloc` and was guarded and
+    // checked ~600 times a frame). Under Wine on Linux 6.7+ watching is the
+    // kernel's (userfaultfd), free until asked.
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const NOT_WATCHABLE: u32 = 0x40_0000 /* physical */ | 0x2000_0000 /* large pages */ | 0x4_0000 /* placeholder */;
+    if kind & MEM_RESERVE != 0 && kind & NOT_WATCHABLE == 0 {
+        // SAFETY: the title's own arguments, plus write watching.
+        let at = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(address, size, kind | MEM_WRITE_WATCH, protect)
+        };
+        if !at.is_null() {
+            return at;
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(address, size, kind, protect) }

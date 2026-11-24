@@ -38,6 +38,12 @@ struct Journal {
     /// Page ranges the kernel was asked about since the submission began
     /// (see [`new_submission`]); under Wine only.
     asked_now: Vec<(usize, usize)>,
+    /// View memory guarded since then (answers only callers that take
+    /// guarding: writes through other views are not seen there).
+    guarded_now: Vec<(usize, usize)>,
+    /// Pages the kernel said are not write-watched since then (view
+    /// memory): not asked again until the next frame.
+    unwatched_now: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -45,6 +51,8 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     written: BTreeMap::new(),
     found: Vec::new(),
     asked_now: Vec::new(),
+    guarded_now: Vec::new(),
+    unwatched_now: Vec::new(),
 });
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -68,10 +76,46 @@ fn on_wine() -> bool {
 /// (17 GB checked per frame, 3 s of a frame). A write between two askings
 /// in one submission keeps its dirty bit, so the next submission sees it.
 pub(crate) fn new_submission() {
-    if on_wine() {
-        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked_now.clear();
+    if on_wine() && !per_frame() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked_now.clear();
+        j.guarded_now.clear();
+        j.unwatched_now.clear();
     }
 }
+
+/// Whether the kernel is asked once per frame rather than once per
+/// submission (`VICTORY_WATCH_PER=submission` for the latter). The world
+/// sends about 30 submissions a frame, and asking again for each cost
+/// about 430 ms of a frame (play47: 1,482 askings, 10.6 GB checked, 98 %
+/// unchanged). shortcut: a CPU write between two submissions of one frame,
+/// to memory a copy already took this frame, reaches the copy only in the
+/// next frame (its dirty bit stays set, so it is not lost).
+pub(crate) fn per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !std::env::var("VICTORY_WATCH_PER").is_ok_and(|v| v.trim() == "submission");
+        tracing::info!(per_frame = on, "write watches asked once per frame");
+        on
+    })
+}
+
+/// A frame was presented: with [`per_frame`], memory asked about from now
+/// on is asked of the kernel again.
+pub(crate) fn new_frame() {
+    #[cfg(feature = "diagnostics")]
+    FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if on_wine() && per_frame() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked_now.clear();
+        j.guarded_now.clear();
+        j.unwatched_now.clear();
+    }
+}
+
+/// Frames begun (diagnostics: askings per frame).
+#[cfg(feature = "diagnostics")]
+static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -85,27 +129,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Under Wine, only the pages no asking of this submission covered yet
     // (copies of nested and overlapping buffers ask about parts of the
     // same memory many times).
-    let gaps = if on_wine() {
+    let gaps = if on_wine() && guarded && !j.guarded_now.is_empty() {
+        let mut both = j.asked_now.clone();
+        both.extend_from_slice(&j.guarded_now);
+        uncovered(&both, first, last)
+    } else if on_wine() {
         uncovered(&j.asked_now, first, last)
     } else {
         vec![(first, last)]
     };
     let mut pages = Vec::new();
-    for (i, &(a, b)) in gaps.iter().enumerate() {
-        match ask(j, a, b) {
+    for &(a, b) in &gaps {
+        // Known this frame not to be write-watched: no asking.
+        let known_unwatched = on_wine()
+            && per_frame()
+            && uncovered(&j.unwatched_now, a, b).is_empty();
+        let answer = if known_unwatched { None } else { ask(j, a, b) };
+        if answer.is_none() && !known_unwatched && on_wine() && per_frame() {
+            j.unwatched_now.push((a, b));
+            if j.unwatched_now.len() >= 256 {
+                merge(&mut j.unwatched_now);
+            }
+        }
+        match answer {
             Some(found) => {
                 pages.extend(found);
-                if on_wine() && j.asked_now.len() < 4096 {
+                if on_wine() {
                     j.asked_now.push((a, b));
+                    if j.asked_now.len() >= 256 {
+                        merge(&mut j.asked_now);
+                    }
                 }
             }
             // Not write-watched: view memory (all of it, as the first
             // asking is of the whole range when none of it was asked).
             None if !guarded => return None,
-            None if i == 0 && (a, b) == (first, last) => {
-                pages.extend(guard(first * PAGE, last * PAGE)?);
+            None => {
+                pages.extend(guard(a * PAGE, b * PAGE)?);
+                if on_wine() && per_frame() {
+                    j.guarded_now.push((a, b));
+                    if j.guarded_now.len() >= 256 {
+                        merge(&mut j.guarded_now);
+                    }
+                }
             }
-            None => pages.extend(guard(a * PAGE, b * PAGE)?),
         }
     }
     j.asked += 1;
@@ -120,6 +187,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Coalesces overlapping or adjacent page ranges in place.
+fn merge(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(a, b) in ranges.iter() {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    *ranges = out;
 }
 
 /// The parts of pages `[first, last)` that no range of `asked` covers, in
@@ -174,6 +254,50 @@ fn ask(j: &mut Journal, first: usize, last: usize) -> Option<Vec<usize>> {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // Which ranges are asked most (play50: ~1,600 askings a frame).
+        static ASKED: Mutex<Option<std::collections::HashMap<(usize, usize, bool), u32>>> = Mutex::new(None);
+        let mut m = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let m = m.get_or_insert_with(Default::default);
+        *m.entry((first * PAGE, (last - first) * PAGE, failed)).or_default() += 1;
+        if m.values().sum::<u32>() >= 5000 {
+            let mut top: Vec<_> = m.drain().collect();
+            top.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let text: Vec<String> = top
+                .iter()
+                .take(12)
+                .map(|((a, n, f), c)| format!("{a:#x}+{n:#x}{} x{c}", if *f { " (not watched)" } else { "" }))
+                .collect();
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frames = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+            let frames = frames - LAST.swap(frames, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(distinct = top.len(), frames, "write watch askings, most asked: {}", text.join(", "));
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    if failed {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query of our own address space.
+        unsafe { VirtualQuery((first * PAGE) as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        let base = info.AllocationBase as usize;
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get_or_insert_with(Default::default).insert(base) {
+            tracing::info!(
+                at = format_args!("{:#x}", first * PAGE),
+                base = format_args!("{base:#x}"),
+                kind = format_args!("{:#x}", info.Type),
+                state = format_args!("{:#x}", info.State),
+                protect = format_args!("{:#x}/{:#x}", info.AllocationProtect, info.Protect),
+                region = info.RegionSize,
+                asked = (last - first) * PAGE,
+                error = std::io::Error::last_os_error().raw_os_error(),
+                "write watch: memory not watched"
+            );
+        }
     }
     if failed {
         return None;

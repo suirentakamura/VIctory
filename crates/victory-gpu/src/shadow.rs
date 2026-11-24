@@ -316,7 +316,17 @@ impl Shadow {
         out: &mut Vec<UploadCopy>,
     ) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // Asked for the whole buffer: later refreshes of other parts of
+            // it this frame are then answered from the journal
+            // (`watch::per_frame`); the answer is cut to the range.
+            let (whole_from, whole_to) = if crate::watch::per_frame() {
+                (self.start as usize, (self.start + self.len) as usize)
+            } else {
+                (from, to)
+            };
+            if let Some((now, mut written)) = crate::watch::writes(whole_from, whole_to, true) {
+                let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+                written.retain(|&(p, _)| (first..last).contains(&p));
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written, alloc, out);
                 #[cfg(feature = "diagnostics")]

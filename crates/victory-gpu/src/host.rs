@@ -2279,6 +2279,7 @@ impl Meter {
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
         crate::uma::drain();
+        crate::watch::new_frame();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;

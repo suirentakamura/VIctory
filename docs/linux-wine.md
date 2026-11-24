@@ -31,6 +31,25 @@ Nothing here needs game data in the repository; supply your own files as usual.
 - **Rectangle lists.** CPU expansion, GPU expansion for indirect draws (#346)
   and a geometry stage for rectangles placed by vertex number (#1020).
 
+## Frame rate: what made the world slow under Wine
+
+- **The system wineserver.** Wine's loader starts the wineserver next to its
+  own binary and only falls back to `$WINESERVER`, so the indexed view lookup
+  (#340) was never in use: with ~117,000 mapped views and ~800 maps a second
+  the stock server spent ~60 % of a CPU searching them, and every request
+  waited for it. Start the patched server yourself before `wine`
+  (`$WINESERVER -p`). In the opening cinematic this took preparation from
+  1-3 s to ~120 ms a frame (play55 → play56).
+- **Write-watch askings once per frame** (`VICTORY_WATCH_PER=submission`
+  restores per submission): answers, including "not watched" and guarded
+  view memory, are kept for the frame; ~1,500 askings a frame became ~550
+  distinct ones.
+- The title's own `VirtualAlloc` reservations are write-watched, like
+  `XMemVirtualAlloc`'s.
+
+What is left (play56, ~0.6-1 s a frame): GPU time (~330-600 ms) and reading
+shader writes back (~150-220 ms).
+
 ## Unified memory experiment (`VICTORY_UMA`, off by default)
 
 The world's frames take 1-2 s, most of it spent keeping host copies of title
