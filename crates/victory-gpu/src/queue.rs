@@ -288,7 +288,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
         let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
-        if host.present(&[(&copy.texture, state)], frame).is_some() {
+        if host.present(&copy.texture, state, frame).is_some() {
             return S_OK;
         }
     }
