@@ -403,9 +403,10 @@ uint f32_to_half(float v) {
         bool up = r > halfway || (r == halfway && (q & 1u) != 0u);
         return sgn | (q + (up ? 1u : 0u));
     }
-    // Added, not or-ed: a rounding carry out of the mantissa raises the
-    // exponent, as in primitive.rs.
-    return sgn | (((uint)ex << 10u) + ((man + 0x1000u) >> 13u));
+    // To nearest, halfway cases to even; added, not or-ed: a rounding carry
+    // out of the mantissa raises the exponent, as in primitive.rs.
+    uint retained = (man >> 13u) & 1u;
+    return sgn | (((uint)ex << 10u) + ((man + 0x0fffu + retained) >> 13u));
 }
 
 float read_comp(uint kind, uint pos) {
@@ -1062,11 +1063,12 @@ mod tests {
                 [200, 20, 10, 100],
                 0x0102_0304,
             ),
-            // Rect 2 (verts 6..9)
+            // Rect 2 (verts 6..9); its u fourth corner is 1 + 2^-11, halfway
+            // between two halves (rounds to the even 0x3c00)
             vertex(
                 10.0,
                 20.0,
-                0x3e00,
+                0x3c00,
                 0x4200,
                 12345,
                 54321,
@@ -1076,7 +1078,7 @@ mod tests {
             vertex(
                 10.0,
                 30.0,
-                0x4000,
+                0x0000,
                 0x4400,
                 22222,
                 11111,
@@ -1086,7 +1088,7 @@ mod tests {
             vertex(
                 40.0,
                 30.0,
-                0x4200,
+                0x1000,
                 0x4000,
                 33333,
                 22222,
