@@ -1701,22 +1701,62 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // Something is unmapped. The kernel's regions say what: one read per
+    // committed region and zeros for the rest. Trying blind 64 KiB and
+    // 4 KiB pieces instead cost a failing system call per piece, which
+    // under Wine took most of a world frame (hundreds of MB unmapped).
+    for_regions(src as usize, len, |at, n, mapped| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+        if mapped && read(at as *const u8, to, n) {
+            return;
         }
+        if !mapped {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+            return;
+        }
+        // Readable by its region yet the read failed: page by page.
+        for_pieces(at, n, 4 << 10, |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            if !read(at as *const u8, to, n) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                // SAFETY: inside the destination, which is mapped.
+                unsafe { to.write_bytes(0, n) };
+            }
+        });
     });
+}
+
+/// Calls `f` with the pieces of `[start, start + len)` cut where the
+/// kernel's memory regions change, and whether each piece is committed and
+/// readable. A failed query ends the walk with the rest as not mapped.
+fn for_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = start.saturating_add(len);
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            f(at, end - at, false);
+            return;
+        }
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .clamp(at + 1, end);
+        let mapped = info.State == MEM_COMMIT
+            && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+            && info.Protect != 0;
+        f(at, next - at, mapped);
+        at = next;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1751,8 +1791,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+    // As in `copy_mapped`: by region, skipping what is not mapped.
+    for_regions(dst as usize, len, |at, n, mapped| {
+        if mapped && !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 write(at, n);
             });
