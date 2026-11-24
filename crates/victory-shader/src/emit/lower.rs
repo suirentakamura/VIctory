@@ -2095,6 +2095,77 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        // Bytes and halves: (bits, signed) of `ds_read_{u,i}{8,16}` and
+        // `ds_write_b{8,16}`, read and written within their dword.
+        // shortcut: a half at byte 3 of a dword (crossing into the next) is
+        // taken as within it.
+        // `_d16`: the value is a 16-bit half of the VGPR (`_hi`: the high
+        // one); a read keeps the other half.
+        let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
+        let (d16, hi) = (name.contains("_d16"), name.ends_with("_hi"));
+        let narrow = match base {
+            "ds_read_u8" | "ds_write_b8" => Some((8u32, false)),
+            "ds_read_i8" => Some((8, true)),
+            "ds_read_u16" | "ds_write_b16" => Some((16, false)),
+            "ds_read_i16" => Some((16, true)),
+            _ => None,
+        };
+        if let Some((bits, signed)) = narrow {
+            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+            let (o, three) = (k(self, offset), k(self, 3));
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let byte = self.s.m.bin(c, Bin::And, at, three);
+            let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+            let p = dword(self, offset);
+            let mask = k(self, (1u32 << bits) - 1);
+            if name.starts_with("ds_read") {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let w = self.s.m.load(c, p);
+                let x = self.s.m.bin(c, Bin::LShr, w, shift);
+                let x = if signed {
+                    // Up to the top, then arithmetically back down.
+                    let up = k(self, 32 - bits);
+                    let t = self.s.m.bin(c, Bin::Shl, x, up);
+                    self.s.m.bin(c, Bin::AShr, t, up)
+                } else {
+                    self.s.m.bin(c, Bin::And, x, mask)
+                };
+                let x = if !d16 {
+                    x
+                } else if !hi {
+                    self.low_half(inst, reg, x)
+                } else {
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => k(self, 0),
+                    };
+                    let (low, sixteen) = (k(self, 0xFFFF), k(self, 16));
+                    let old = self.s.m.bin(c, Bin::And, old, low);
+                    let x = self.s.m.bin(c, Bin::Shl, x, sixteen);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+            } else {
+                let mut v = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                if hi {
+                    let sixteen = k(self, 16);
+                    v = self.s.m.bin(c, Bin::LShr, v, sixteen);
+                }
+                let v = self.s.m.bin(c, Bin::And, v, mask);
+                let v = self.s.m.bin(c, Bin::Shl, v, shift);
+                let hole = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let all = k(self, u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, hole, all);
+                // Two atomics: lanes writing other bytes of the same dword
+                // keep theirs.
+                use super::bitcode::Rmw;
+                let at = self.begin_guarded(guard);
+                self.s.m.atomic(self.cur, Rmw::And, p, keep);
+                self.s.m.atomic(self.cur, Rmw::Or, p, v);
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
@@ -2847,7 +2918,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err("a scalar memory read as data without a scalar destination");
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -2855,7 +2926,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("a scalar memory read as data of another kind"),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -2909,7 +2980,19 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // A buffer descriptor also read by `s_buffer_load`: a raw SRV
+            // has a size (a constant buffer view does not).
+            Fields::Smem { .. } => match used.map(|u| u.kind) {
+                Some(ResourceType::Srv) => ((11 | u, 0), None),
+                Some(ResourceType::Cbv) => {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a descriptor read as data and by a scalar load"),
+            },
+            Fields::Flat { .. } => {
+                return Err("a descriptor read as data and by a global access");
+            }
+            _ => return Err("a descriptor read as data and by another instruction"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -5439,8 +5522,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" => (60, true),
-            "image_sample_lz" | "image_sample_l" => (62, true),
+            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
+                (62, true)
+            }
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
@@ -5577,6 +5662,24 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            if offset_word && op != 73 {
+                // A sample's offsets are immediates on the host: the word
+                // must be a constant, each 6-bit offset within -8..7.
+                let w = addr_val(self, 0)?;
+                let bits = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("an image sample with a computed texel offset")?;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let v = ((bits as u32) >> (8 * k) & 0x3F) as i32;
+                    let v = (v << 26) >> 26;
+                    if !(-8..=7).contains(&v) {
+                        return Err("an image sample with a texel offset beyond -8..7");
+                    }
+                    *o = self.s.m.i32(v as u32);
+                }
+            }
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
@@ -5644,8 +5747,8 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                    let lod = if name.starts_with("image_sample_l_") || name == "image_sample_l" {
+                        let x = addr_val(self, first + coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
