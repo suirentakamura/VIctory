@@ -528,3 +528,36 @@ fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
         assert!(summary.contains(op), "{op} in {summary}");
     }
 }
+
+/// Sum lane IDs within rows, add the preceding row, then carry lane 31's
+/// inclusive result into the upper half. Lane 32 must start at 528.
+#[test]
+fn wave64_inclusive_prefix_joins_both_host_waves() {
+    let body = [
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32 v1, 0, v0, s[0:1]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32 v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E06_02FA,
+        0xAF00_E402, // v_mov_b32 v3, v2, row_mask:0xa
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01, // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4A02_0209, // v_add_nc_u32 v1, s9, v1
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_0301, // v_mov_b32 v2, v1
+    ];
+    console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
+}
