@@ -890,6 +890,9 @@ impl State {
             view.dword,
         ) {
             (Root::View(address), None) => Some(*address),
+            (Root::Constants(c), Some(dword)) if view.shifted => {
+                Some(u64::from(*c.get(usize::from(dword))?) << 8)
+            }
             (Root::Constants(c), Some(dword)) => {
                 let d = usize::from(dword);
                 Some(u64::from(*c.get(d)?) | u64::from(*c.get(d + 1)?) << 32)
@@ -1534,7 +1537,7 @@ mod tests {
         let mut s = State::default();
         s.set_view(true, 1, 0x1234_5678_9000);
         s.set_constants(true, 3, &[7, 0x9abc_0000, 0x12, 9], 0);
-        let at = |slot, dword| RootView { slot, dword }.register();
+        let at = |slot, dword| RootView { slot, dword, shifted: false }.register();
         assert_eq!(s.view_address(true, at(1, None)), Some(0x1234_5678_9000));
         // An address in root constants 1 and 2 of parameter 3 (#614).
         assert_eq!(s.view_address(true, at(3, Some(1))), Some(0x12_9abc_0000));
@@ -1544,6 +1547,17 @@ mod tests {
         assert_eq!(s.view_address(true, at(1, Some(0))), None);
         assert_eq!(s.view_address(true, at(3, None)), None);
         assert_eq!(s.view_address(false, at(1, None)), None);
+        // One root constant holding a 256-byte aligned address shifted
+        // right by 8 (the BVH builder's headers).
+        let shifted = RootView {
+            slot: 3,
+            dword: Some(1),
+            shifted: true,
+        }
+        .register();
+        assert_eq!(RootView::of(shifted).dword, Some(1));
+        assert!(RootView::of(shifted).shifted);
+        assert_eq!(s.view_address(true, shifted), Some(0x9a_bc00_0000));
     }
 
     use crate::descriptor::host::HostHeap;

@@ -180,25 +180,33 @@ pub struct HostShader {
 /// Where the address of a root view comes from, and the register it is
 /// bound at: the title's root parameter index for a root descriptor;
 /// `(dword + 1) << 8 | slot` for an address in two root constants, low
-/// half at `dword` (#614).
+/// half at `dword` (#614), with bit 15 set for an address in one root
+/// constant shifted right by 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootView {
     /// Root parameter index in the title's root signature.
     pub slot: u8,
     /// The root constant holding the address's low half (the high half is
-    /// the next one); none for a root descriptor. Below 255.
+    /// the next one); none for a root descriptor. Below 127.
     pub dword: Option<u8>,
+    /// The root constant at `dword` holds the whole address shifted right
+    /// by 8 (256-byte aligned, 40 bits in one dword), as the BVH builder
+    /// passes its headers.
+    pub shifted: bool,
 }
 
 impl RootView {
     pub fn register(self) -> u16 {
-        u16::from(self.dword.map_or(0, |d| d + 1)) << 8 | u16::from(self.slot)
+        let shifted = if self.shifted { 0x80 } else { 0 };
+        u16::from(self.dword.map_or(0, |d| d + 1) | shifted) << 8 | u16::from(self.slot)
     }
 
     pub fn of(register: u16) -> RootView {
+        let high = register >> 8;
         RootView {
             slot: register as u8,
-            dword: (register >> 8).checked_sub(1).map(|d| d as u8),
+            dword: (high & 0x7f).checked_sub(1).map(|d| d as u8),
+            shifted: high & 0x80 != 0,
         }
     }
 }

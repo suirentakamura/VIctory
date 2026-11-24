@@ -4294,10 +4294,11 @@ impl<'a> Lower<'a> {
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
                 let view = |dword| {
-                    let dword = u8::try_from(dword).ok().filter(|&d| d < u8::MAX)?;
+                    let dword = u8::try_from(dword).ok().filter(|&d| d < 0x7f)?;
                     let view = RootView {
                         slot: rp.slot,
                         dword: Some(dword),
+                        shifted: address.shift == 8,
                     };
                     Some(view.register())
                 };
@@ -9225,9 +9226,79 @@ mod tests {
         let view = super::RootView {
             slot: 3,
             dword: Some(2),
+            shifted: false,
         };
         assert_eq!(l.root_srvs, [view.register()]);
         assert!(l.root_cbvs.is_empty());
+    }
+
+    #[test]
+    fn an_address_in_one_root_constant_shifted_by_8_reads_a_root_view() {
+        // Root constants at user data 8 (root parameter 3); dword 1 (s9) is
+        // an address shifted right by 8, which the program shifts back and
+        // reads a dword 12 bytes in from, as the BVH builder reads a count
+        // from its header.
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0309, // s_mov_b32 s4, s9
+            0x8F84_8804, // s_lshl_b64 s[4:5], s[4:5], 8
+            0x8804_8C04, // s_or_b32 s4, s4, 12
+            0xF400_0182,
+            0xFA00_0000, // s_load_dword s6, s[4:5], 0
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE87_0380, // s_mov_b32 s7, 0
+            S_ENDPGM,
+        ];
+        let constants = crate::native::RootParam {
+            root: crate::native::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 8,
+            slot: 3,
+        };
+        let l = lowered(&words, vec![constants], 0).unwrap();
+        let view = super::RootView {
+            slot: 3,
+            dword: Some(1),
+            shifted: true,
+        };
+        assert_eq!(l.root_srvs, [view.register()]);
+    }
+
+    #[test]
+    fn an_address_in_two_root_constants_plus_a_lane_offset_is_a_root_view() {
+        // s[10:11] (root constants 2 and 3) plus the lane's index times 8,
+        // the carry into the high half: the constants are the base, the
+        // index the computed term.
+        let words = [
+            0x3400_0083, // v_lshlrev_b32 v0, 3, v0
+            0xD70F_0001,
+            0x0202_000A, // v_add_co_u32 v1, s0, s10, v0
+            0xD528_0002,
+            0x0001_000B, // v_add_co_ci_u32 v2, s0, s11, 0, s0
+            0xDC30_8000,
+            0x037D_0001, // global_load_dword v3, v[1:2], off
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7E08_0303, // v_mov_b32 v4, v3
+            S_ENDPGM,
+        ];
+        let constants = crate::native::RootParam {
+            root: crate::native::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 8,
+            slot: 3,
+        };
+        let l = lowered(&words, vec![constants], 0).unwrap();
+        let view = super::RootView {
+            slot: 3,
+            dword: Some(2),
+            shifted: false,
+        };
+        assert_eq!(l.root_srvs, [view.register()]);
     }
 
     #[test]
@@ -9294,6 +9365,7 @@ mod tests {
         let view = super::RootView {
             slot: 3,
             dword: Some(2),
+            shifted: false,
         };
         assert_eq!(l.root_cbvs, [view.register()]);
         assert!(l.root_srvs.is_empty());

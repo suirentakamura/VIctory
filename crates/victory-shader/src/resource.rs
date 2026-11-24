@@ -34,6 +34,9 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// 8 when the root constant at `dword` holds the address shifted right
+    /// by 8 (one dword, 256-byte aligned), else 0.
+    pub shift: u8,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -637,7 +640,19 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let mut s = self.sum(lo);
+        if let Some((v, shift, offset)) = self.shifted(lo, hi) {
+            let (param, dword) = self.inputs[v.0 as usize]
+                .and_then(|reg| self.param_of(reg))
+                .ok_or("an address not from a root parameter")?;
+            return Ok(Address {
+                param,
+                dword,
+                shift,
+                offset: offset.wrapping_add(extra.offset),
+                dynamic: extra.dynamic,
+            });
+        }
+        let mut s = self.constants_plus(lo, hi).unwrap_or_else(|| self.sum(lo));
         // A root constant past a parameter's first dword is a computed term
         // to `sum`; with no other base, it is an address's low half.
         if s.base.is_none()
@@ -663,6 +678,7 @@ impl<'a> Tracer<'a> {
             return Ok(Address {
                 param: CODE,
                 dword: 0,
+                shift: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -704,9 +720,90 @@ impl<'a> Tracer<'a> {
         Ok(Address {
             param,
             dword,
+            shift: 0,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
         })
+    }
+
+    /// `lo` adds a computed term to an address's low half in root constants
+    /// (`c[d] + x`) whose high half `hi` carries into the next constant: the
+    /// constant is the base. `sum` alone cannot tell it from an index, as
+    /// both are computed terms to it.
+    fn constants_plus(&self, lo: Term, hi: Term) -> Option<Sum> {
+        let Term::Value(v) = lo else {
+            return None;
+        };
+        let [a, b] = self
+            .sop2(v, &["s_add_u32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))?;
+        [(a, b), (b, a)].into_iter().find_map(|(base, other)| {
+            let Term::Value(base) = base else {
+                return None;
+            };
+            let reg @ Reg::S(code) = self.inputs[base.0 as usize]? else {
+                return None;
+            };
+            let (param, dword) = self.param_of(reg)?;
+            if self.layout[param].root != RootType::Constants
+                || dword + 1 >= self.layout[param].sgprs
+            {
+                return None;
+            }
+            let high = self.p.inputs.iter().find(|i| i.0 == Reg::S(code + 1))?.1;
+            let rest = self.sum(other);
+            (self.carried(hi, high) && rest.base.is_none()).then_some(Sum {
+                base: Some(base),
+                offset: rest.offset,
+                dynamic: rest.dynamic,
+            })
+        })
+    }
+
+    /// An address one root constant holds shifted right by 8 (a 40-bit,
+    /// 256-byte aligned address in a dword): `lo` and `hi` are the halves
+    /// of `s_lshl_b64 {constant, 0}, 8`, the low half possibly with bits
+    /// below 256 set by `s_or_b32` or `s_add_u32` of a constant (no carry
+    /// then). The constant, the shift, and those bits.
+    fn shifted(&self, lo: Term, hi: Term) -> Option<(Value, u8, u32)> {
+        let Term::Value(mut low) = lo else {
+            return None;
+        };
+        let mut offset = 0;
+        if let Some((_, terms)) = self.sop2(low, &["s_or_b32", "s_add_u32"]) {
+            let ([Term::Value(x), Term::Const(c)] | [Term::Const(c), Term::Value(x)]) = terms
+            else {
+                return None;
+            };
+            (low, offset) = (x, c);
+        }
+        let inst = self.def(low)?;
+        if inst.name() != "s_lshl_b64" || inst.writes.first()?.1 != low {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let Operand::Scalar { code, .. } = *src.first()? else {
+            return None;
+        };
+        let Reg::S(dst) = inst.writes.first()?.0 else {
+            return None;
+        };
+        let high = inst.write(Reg::S(dst + 1))?;
+        if hi != Term::Value(high)
+            || self.term(inst, src.get(1)?)? != Term::Const(8)
+            || offset >= 1 << 8
+            || self.origin(inst.read(Reg::S(code + 1))?) != Term::Const(0)
+        {
+            return None;
+        }
+        let Term::Value(v) = self.origin(inst.read(Reg::S(code))?) else {
+            return None;
+        };
+        let (param, _) = self.param_of(self.inputs[v.0 as usize]?)?;
+        (self.layout[param].root == RootType::Constants).then_some((v, 8, offset))
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
@@ -1855,6 +1952,7 @@ pub(crate) mod tests {
             dword: 0,
             offset,
             dynamic: None,
+            shift: 0,
         }
     }
 
