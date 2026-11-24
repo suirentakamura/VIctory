@@ -921,6 +921,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -940,10 +941,11 @@ pub enum View<'a> {
     Buffer { data: &'a [u32], stride: Stride },
     /// A buffer UAV of this many dwords, zeroed, viewed as the stride says.
     BufferUav(u32, Stride),
-    /// A raw view of the whole buffer the view at this (earlier) heap index
-    /// is made on, an SRV or a UAV as that view is: what the GPU side makes
-    /// for the runtime stride table. Not among the UAVs read back.
-    RawAlias(usize),
+    /// A raw view of `dwords` dwords from dword `first` of the buffer the
+    /// view at the (earlier) heap index `of` is made on, an SRV or a UAV as
+    /// that view is: what the GPU side makes for the runtime stride table
+    /// ([`super::RawWindow`]). Not among the UAVs read back.
+    RawAlias { of: usize, first: u32, dwords: u32 },
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1321,19 +1323,23 @@ impl Host {
                         buffers[i] = Some((b.clone(), data.len() as u32, false));
                         keep.push(b);
                     }
-                    View::RawAlias(of) => {
+                    View::RawAlias { of, first, dwords } => {
                         let (b, n, unordered) = buffers
                             .get(of)
                             .cloned()
                             .flatten()
                             .ok_or("a raw alias of no earlier buffer view")?;
+                        if first + dwords > n {
+                            return Err("a raw alias past its buffer".into());
+                        }
                         if unordered {
                             let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                                 Format: DXGI_FORMAT_R32_TYPELESS,
                                 ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
                                 Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                     Buffer: D3D12_BUFFER_UAV {
-                                        NumElements: n,
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
                                         Flags: D3D12_BUFFER_UAV_FLAG_RAW,
                                         ..Default::default()
                                     },
@@ -1347,8 +1353,8 @@ impl Host {
                                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                     Buffer: D3D12_BUFFER_SRV {
-                                        FirstElement: 0,
-                                        NumElements: n,
+                                        FirstElement: u64::from(first),
+                                        NumElements: dwords,
                                         StructureByteStride: 0,
                                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                                     },

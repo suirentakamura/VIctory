@@ -3384,7 +3384,8 @@ impl<'a> Lower<'a> {
     /// stride table: the handle is of the slot the table names, which holds
     /// a raw view of the buffer's bytes whatever view the title made (raw,
     /// structured or typed), and the byte is `index * stride + off` past
-    /// that view's bias.
+    /// that view's bias. The raw view ends with the title's view, so an
+    /// index past its elements reads zeros (and its writes are dropped).
     /// shortcut: the console reads zeros (and drops writes) where `off` and
     /// the access pass the element's end; here they reach the next element,
     /// as the statically known strides' structured accesses may.
