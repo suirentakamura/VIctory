@@ -6,7 +6,8 @@ the user supplies.
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+[docs/architecture.md](docs/architecture.md). Running under Wine on Linux:
+[docs/linux-wine.md](docs/linux-wine.md).
 
 ## Status (2026-11-23)
 
