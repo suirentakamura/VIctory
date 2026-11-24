@@ -1827,6 +1827,21 @@ impl Host {
                 }
             }
         }
+        // Leave the copy list closed if compositor initialization fails.
+        let compositor = if planes.len() > 1 {
+            if p.compositor.as_ref().is_none_or(|c| c.format != format) {
+                match Compositor::new(&self.device, format) {
+                    Ok(c) => p.compositor = Some(c),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no present compositor");
+                        return None;
+                    }
+                }
+            }
+            Some(p.compositor.as_ref()?)
+        } else {
+            None
+        };
         // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1872,16 +1887,7 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                if p.compositor.as_ref().is_none_or(|c| c.format != format) {
-                    match Compositor::new(&self.device, format) {
-                        Ok(c) => p.compositor = Some(c),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "no present compositor");
-                            return None;
-                        }
-                    }
-                }
-                let comp = p.compositor.as_ref()?;
+                let comp = compositor.expect("compositor was created for multiple planes");
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
