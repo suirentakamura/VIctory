@@ -16,6 +16,12 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+/// [`build`] for a program with `handles` accesses by each lane's own heap
+/// index.
+fn build_with(words: &[u32], buffers: bool, handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -74,8 +80,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         per_lane_only: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    // Accesses with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, handles);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -233,6 +239,20 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     assert!(!results.is_empty());
     for (label, red) in results {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
+fn lanes_read_the_base_level_of_their_own_entry_in_a_waterfall() {
+    use crate::resource::tests::WATERFALL_BASE_LEVEL_WAVE32;
+    // The base level read in the first loop and the sample in the second.
+    let shader = build_with(WATERFALL_BASE_LEVEL_WAVE32, false, 2);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    for (label, red) in results {
+        // The host views start at their level 0: the sample plus 0.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
     }

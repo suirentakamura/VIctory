@@ -3804,7 +3804,10 @@ impl<'a> Lower<'a> {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
+            })
+            // Loaded only to read its fields: another load of the same
+            // descriptor tells its kind.
+            .or_else(|| self.sibling_use(site));
         let Some((at, first)) = use_at else {
             // No resource access uses what it loads: data read through an
             // address a root parameter gives (constants, a root view).
@@ -3931,6 +3934,68 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// For a descriptor load no access uses (the console compiler loads a
+    /// descriptor again only to read its fields, such as an image's base
+    /// level in a waterfall loop): the access and first dword of another
+    /// load of the same descriptor from a table or heap, at the same
+    /// address, or at the first lane's offset of the same lane value.
+    fn sibling_use(&self, site: Site) -> Option<(Site, u8)> {
+        let a = *self.scalar.get(&site)?;
+        if !self.x.native.layout.get(a.param).is_some_and(|p| {
+            matches!(
+                p.root,
+                RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+            )
+        }) {
+            return None;
+        }
+        let lane = |v: Value| self.first_lane_source(v).unwrap_or(v);
+        let key = a.dynamic.map(lane);
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .find_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first } if load != site => {
+                        let b = self.scalar.get(&load)?;
+                        (b.param == a.param
+                            && b.dword == a.dword
+                            && b.offset == a.offset
+                            && b.shift == a.shift
+                            && b.dynamic.map(lane) == key)
+                            .then_some((d.site, first))
+                    }
+                    _ => None,
+                })
+            })
+    }
+
+    /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
+    fn first_lane_source(&self, v: Value) -> Option<Value> {
+        self.x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|inst| {
+                if inst.name() != "v_readfirstlane_b32" || !inst.writes.iter().any(|w| w.1 == v) {
+                    return None;
+                }
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                if f.sdwa.is_some() || f.dpp.is_some() {
+                    return None;
+                }
+                let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                    return None;
+                };
+                inst.read(Reg::V(reg))
+            })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -9281,6 +9346,25 @@ mod tests {
             shifted: false,
         };
         assert_eq!(l.root_srvs, [view.register()]);
+    }
+
+    #[test]
+    fn a_descriptor_loaded_only_for_its_base_level_takes_its_kind_from_another_load() {
+        // A first waterfall loads each lane's table entry only to read its
+        // base level; the second loads it again and samples. Without the
+        // second load's kind the first stopped the program ("a descriptor
+        // read only as data").
+        let table = |user_data: u8| crate::native::RootParam {
+            root: crate::native::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let words = crate::resource::tests::WATERFALL_BASE_LEVEL_WAVE32;
+        let l = lowered(words, vec![table(0), table(1)], 2 << 1).unwrap();
+        assert_eq!(l.nonuniform_handles, 2);
     }
 
     #[test]

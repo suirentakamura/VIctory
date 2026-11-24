@@ -175,6 +175,8 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    // Scalar loads at a first lane's offset, by block.
+    let mut load_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -215,6 +217,15 @@ pub fn track(
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    // A load at the first lane's offset: a waterfall loop's
+                    // even when no access uses what it loads.
+                    if let Some(Term::Value(v)) = address.dynamic.map(|d| t.origin(d))
+                        && t.first_lane_source(v).is_some()
+                    {
+                        let (loads, reads) = load_at.entry(b).or_default();
+                        loads.push(i);
+                        reads.push(v);
+                    }
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -264,13 +275,41 @@ pub fn track(
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
-    for (block, (accesses, mut reads, loads)) in offset_at {
+    for (&block, (accesses, reads, loads)) in &offset_at {
+        let mut reads = reads.clone();
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+        if let Ok(proof) = t.waterfall(block, accesses, &reads) {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+            out.waterfall.loads.extend(loads.iter().copied());
+        }
+    }
+    // A loop with no access, only loads at the first lane's offset (the
+    // console compiler reads an image's fields, such as its base level, in
+    // a loop of its own): each lane loads its own entry when the same proof
+    // holds with the loads as the accesses.
+    for (block, (loads, mut reads)) in load_at {
+        if offset_at.contains_key(&block) {
+            continue;
+        }
+        reads.sort_unstable();
+        reads.dedup();
+        // Scalar loads do not read EXEC: the lanes they serve are those
+        // of the first instruction after them that does (the retry's
+        // `s_andn2_wrexec` when nothing else does).
+        let last = *loads.last().expect("a load");
+        let insts = &p.blocks[block].insts;
+        let Some(at) = (last + 1..insts.len()).find(|&i| insts[i].read(Reg::S(EXEC)).is_some())
+        else {
+            continue;
+        };
+        if let Ok(proof) = t.waterfall(block, &[at], &reads) {
+            out.waterfall.compares.extend(proof.compares);
+            out.waterfall.reads.extend(proof.reads);
+            out.waterfall
+                .loads
+                .extend(loads.iter().map(|&i| (block, i)));
         }
     }
     Ok(out)
@@ -2541,6 +2580,59 @@ pub(crate) mod tests {
         0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
         0xBF89_FFF6, // s_cbranch_execnz -> 0x40
         0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] after a first waterfall over the same
+    /// offsets that loads each lane's entry only to read its base level
+    /// (dword 3 bits 12-15, `s_bfe_u32`), as the console compiler does
+    /// before indexing an image by level (Grand Theft Auto VI's lighting
+    /// programs): no access uses that load. The level goes into v17 and is
+    /// added to the sample.
+    pub(crate) const WATERFALL_BASE_LEVEL_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9396_FF0F,
+        0x0004_000C, // s_bfe_u32 s22, s15, 0x4000c
+        0x7E22_0216, // v_mov_b32 v17, s22
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E22_0D11, // v_cvt_f32_u32 v17, v17
+        0x7E28_0507, // 0x74: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x74
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0x0618_230C, // v_add_f32 v12, v12, v17
         0xE070_1000,
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
