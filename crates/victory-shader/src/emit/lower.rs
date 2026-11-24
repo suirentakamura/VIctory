@@ -3729,6 +3729,15 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
+            // No resource access uses what it loads: data read through an
+            // address a root parameter gives (constants, a root view).
+            if let Some(a) = self.scalar.get(&site).copied()
+                && self.x.native.layout.get(a.param).is_some_and(|p| {
+                    matches!(p.root, RootType::Constants | RootType::Descriptor)
+                })
+            {
+                return self.root_smem(inst, site, a, count);
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -3874,6 +3883,71 @@ impl<'a> Lower<'a> {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
             let x = self.code_dword(at)?;
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `s_load_dword*` of `count` dwords from the memory at root-parameter
+    /// address `a`: through the root CBV when the title declares the
+    /// parameter a constant buffer, else through a raw root view (a root
+    /// UAV when it declares one).
+    fn root_smem(&mut self, inst: &Inst, site: Site, a: Address, count: u32) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let rp = *self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .ok_or("a scalar load from no root parameter")?;
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let props = match kind {
+            Some(ResourceType::Cbv) => (13, 0x1_0000),
+            Some(ResourceType::Uav) => (RAW_UAV, 0),
+            _ => (11, 0),
+        };
+        let h = self.handle(site, &src, false, props)?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, off);
+            let x = if props.0 == 13 {
+                self.cbuffer_dword(h, at)
+            } else {
+                let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, at, u, mask, al],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                self.as_int(x)
+            };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -4323,6 +4397,32 @@ impl<'a> Lower<'a> {
     /// shortcut: the console reads zeros (and drops writes) where `off` and
     /// the access pass the element's end; here they reach the next element,
     /// as the statically known strides' structured accesses may.
+    /// The handle and coordinates of byte `off` of element `index` of a
+    /// structured buffer of `stride`-byte elements (`u`: 0x1000 for unordered
+    /// access). A root view has no element type of its own, so one is read
+    /// as a raw buffer at `index * stride + off` (a program may read the same
+    /// root view both ways).
+    fn element(
+        &mut self,
+        site: Site,
+        src: &Source,
+        index: V,
+        off: V,
+        stride: u32,
+        u: u32,
+    ) -> Result<(V, V, V), Why> {
+        if matches!(src, Source::Built { .. }) {
+            let c = self.cur;
+            let s = self.s.m.i32(stride);
+            let at = self.s.m.bin(c, Bin::Mul, index, s);
+            let byte = self.s.m.bin(c, Bin::Add, at, off);
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            return Ok((h, byte, self.s.m.undef(self.s.t.i32)));
+        }
+        let h = self.handle(site, src, false, (12 | u, stride))?;
+        Ok((h, index, off))
+    }
+
     fn runtime_view(
         &mut self,
         src: &Source,
@@ -7606,10 +7706,8 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     if stride >= 4 && stride.is_multiple_of(4) {
-                        (
-                            self.handle(site, src, false, (12 | u, stride))?,
-                            [index, off, iu],
-                        )
+                        let (h, a, b) = self.element(site, src, index, off, stride, u)?;
+                        (h, [a, b, iu])
                     } else {
                         let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
                         (h, [byte, iu, iu])
@@ -7672,10 +7770,8 @@ impl<'a> Lower<'a> {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride >= 4 && stride.is_multiple_of(4) {
-                        (
-                            self.handle(site, src, false, (12 | u, stride))?,
-                            [index, off, iu],
-                        )
+                        let (h, a, b) = self.element(site, src, index, off, stride, u)?;
+                        (h, [a, b, iu])
                     } else {
                         let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
                         (h, [byte, iu, iu])
@@ -7735,8 +7831,9 @@ impl<'a> Lower<'a> {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride >= 4 && stride.is_multiple_of(4) {
-                            args.push(self.handle(site, src, false, (12 | u, stride))?);
-                            args.extend([index, off]);
+                            let (h, a, b) = self.element(site, src, index, off, stride, u)?;
+                            args.push(h);
+                            args.extend([a, b]);
                         } else {
                             let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
                             args.push(h);
@@ -7802,14 +7899,14 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     if stride >= 4 && stride.is_multiple_of(4) {
-                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        let (h, a, b) = self.element(site, src, index, off, stride, u)?;
                         self.s.op(
                             c,
                             "rawBufferLoad.f32",
                             Attr::ReadOnly,
                             self.s.t.res_ret,
                             139,
-                            &[h, index, off, mask, align],
+                            &[h, a, b, mask, align],
                         )
                     } else {
                         let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
@@ -8861,6 +8958,69 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
         })
+    }
+
+    #[test]
+    fn data_loaded_through_two_root_constants_reads_a_root_view() {
+        // Root constants at user data 8 (root parameter 3); dwords 2 and 3
+        // (s[10:11]) are an address the program loads a dword from and
+        // branches on, with no resource access using what it loads.
+        let words = [
+            0xF400_0105,
+            0xFA00_0010, // s_load_dword s4, s[10:11], 0x10
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380, // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let constants = crate::native::RootParam {
+            root: crate::native::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 8,
+            slot: 3,
+        };
+        let l = lowered(&words, vec![constants], 0).unwrap();
+        let view = super::RootView {
+            slot: 3,
+            dword: Some(2),
+        };
+        assert_eq!(l.root_srvs, [view.register()]);
+        assert!(l.root_cbvs.is_empty());
+    }
+
+    #[test]
+    fn a_code_table_address_read_back_from_uniform_vgprs_is_tracked() {
+        // A table after the code at s_getpc + 0x44, indexed by root constant
+        // s8 * 4 computed in VGPRs and read back with v_readfirstlane, as
+        // the BVH builder's programs do.
+        let words = [
+            0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+            0x8002_FF02,
+            0x0000_0044, // 0x04: s_add_u32 s2, s2, 0x44
+            0x8203_8003, // 0x0c: s_addc_u32 s3, s3, 0
+            0x7E02_0208, // 0x10: v_mov_b32 v1, s8
+            0x3402_0282, // 0x14: v_lshlrev_b32 v1, 2, v1
+            0xD70F_6A02,
+            0x0000_0501, // 0x18: v_add_co_u32 v2, vcc_lo, v1, s2
+            0xD528_6A03,
+            0x01A8_0680, // 0x20: v_add_co_ci_u32 v3, vcc_lo, 0, s3, vcc_lo
+            0x7E08_0502, // 0x28: v_readfirstlane_b32 s4, v2
+            0x7E0A_0503, // 0x2c: v_readfirstlane_b32 s5, v3
+            0xF400_0182,
+            0xFA00_0000, // 0x30: s_load_dword s6, s[4:5], null
+            0xBF07_8006, // 0x38: s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // 0x3c: s_cbranch_scc1 -> s_endpgm
+            0xBE87_0380, // 0x40: s_mov_b32 s7, 0
+            S_ENDPGM,    // 0x44
+            7,
+            8,
+            9,
+            10, // 0x48: the table
+        ];
+        let constants = root(RootType::Constants, 8, 0);
+        lowered(&words, vec![constants], 0).unwrap();
     }
 
     #[test]

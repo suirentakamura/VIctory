@@ -507,6 +507,13 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        // An address computed in VGPRs the same in every lane, read back
+        // with `v_readfirstlane_b32`: the terms of the VGPR's sum.
+        if let Some(w) = self.first_lane_source(v)
+            && self.wave_uniform(w, 0)
+        {
+            return self.sum(self.vorigin(w));
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -717,6 +724,11 @@ impl<'a> Tracer<'a> {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
+        }
+        if let Some(w) = self.first_lane_source(v)
+            && self.wave_uniform(w, 0)
+        {
+            return self.carried(self.vorigin(w), high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
@@ -1032,6 +1044,59 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether the VGPR value `v` is the same in every lane: plain VALU
+    /// arithmetic (no lane exchange) of constants, SGPRs and such values.
+    /// Conservative: thread IDs, loads, phis and deep chains are not.
+    fn wave_uniform(&self, v: Value, depth: u32) -> bool {
+        const PURE: &[&str] = &[
+            "v_mov_b32",
+            "v_add_nc_u32",
+            "v_add_co_u32",
+            "v_add_co_ci_u32",
+            "v_sub_nc_u32",
+            "v_sub_co_u32",
+            "v_mul_u32_u24",
+            "v_mul_lo_u32",
+            "v_lshlrev_b32",
+            "v_lshrrev_b32",
+            "v_lshl_add_u32",
+            "v_add_lshl_u32",
+            "v_mad_u32_u24",
+            "v_and_b32",
+            "v_or_b32",
+            "v_xor_b32",
+        ];
+        if depth > 16 {
+            return false;
+        }
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            return matches!(reg, Reg::S(_));
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let Fields::Valu(f) = &inst.fields else {
+            // A scalar instruction's result in an SGPR.
+            return inst.writes.iter().any(|w| w.1 == v && matches!(w.0, Reg::S(_)));
+        };
+        if !PURE.contains(&inst.name()) || f.sdwa.is_some() || f.dpp.is_some() {
+            return false;
+        }
+        f.src.iter().all(|op| match *op {
+            Operand::Vector { reg, .. } => {
+                inst.read(Reg::V(reg)).is_some_and(|w| self.wave_uniform(w, depth + 1))
+            }
+            // An SGPR (a VALU's carry mask only if its inputs are uniform).
+            Operand::Scalar { code, .. } => code == NULL
+                || inst.read(Reg::S(code)).is_some_and(|w| {
+                    !matches!(self.def(w).map(|d| &d.fields), Some(Fields::Valu(_)))
+                        || self.wave_uniform(w, depth + 1)
+                }),
+            Operand::Const(_) | Operand::Literal(_) => true,
+            _ => false,
+        })
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
