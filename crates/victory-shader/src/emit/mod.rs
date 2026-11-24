@@ -204,14 +204,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    // A compute program whose root arguments all sit past the 16 user SGPRs
-    // finds them through the spill table `s[0:1]` points to.
-    let spilled = native.stage == HwStage::Cs
-        && !native.layout.is_empty()
-        && native
-            .layout
-            .iter()
-            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
+    let spilled = native.spills_root_args();
     let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
