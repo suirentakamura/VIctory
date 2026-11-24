@@ -74,16 +74,17 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds (title heap, first, count), given
+    /// back when the list is reset or released, or earlier when a heap runs
+    /// short after the list ran (see [`crate::descriptor::lease`]).
+    lease: std::sync::Arc<crate::descriptor::lease::Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.lease.take() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -170,6 +171,44 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// The list's slots, to start and finish its submissions.
+    pub(crate) fn lease(&self) -> &std::sync::Arc<crate::descriptor::lease::Lease> {
+        &self.lease
+    }
+
+    /// `n` consecutive dynamic slots of `host` (the host heap of the title
+    /// heap at address `key`), held by this list. When the heap has no room,
+    /// the slots of the oldest list that already ran are taken back first,
+    /// one list at a time, instead of dropping the draw.
+    fn take_dynamic(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        key: usize,
+        n: u32,
+    ) -> Option<u32> {
+        let mut reclaimed = false;
+        loop {
+            if let Some(first) = host.dynamic(n) {
+                self.lease.add(key, first, n);
+                return Some(first);
+            }
+            let more = crate::descriptor::lease::reclaim(key, |(heap, first, n)| {
+                if heap == key {
+                    host.release(first, n);
+                } else {
+                    crate::descriptor::release_dynamic(heap, first, n);
+                }
+            });
+            if !more {
+                return None;
+            }
+            if !reclaimed {
+                reclaimed = true;
+                once!("dynamic descriptor slots of lists that already ran are taken back");
+            }
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -723,7 +762,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_dynamic(host, std::ptr::from_ref(heap) as usize, n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -733,8 +772,6 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1214,4 +1251,96 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::host::HostHeap;
+
+    /// The dynamic slots of an empty heap (and the heap left empty).
+    fn capacity(heap: &HostHeap) -> u32 {
+        let mut n = 0;
+        while heap.dynamic(1).is_some() {
+            n += 1;
+        }
+        heap.release(heap.count(), n);
+        n
+    }
+
+    /// A heap with no room takes back the slots of a list that already ran,
+    /// not of one that has not, and the list that lost them is refused.
+    #[test]
+    fn a_full_heap_takes_back_the_slots_of_a_list_that_ran() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0001;
+        let total = capacity(&heap);
+        let chunk = 1000;
+        let mut ran = State::default();
+        let mut taken = 0;
+        while ran.take_dynamic(&heap, key, chunk).is_some() {
+            taken += chunk;
+        }
+        assert!(taken >= total - chunk, "the list filled the heap");
+        // Nothing has run yet: nothing is given back and the draw is dropped.
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, chunk), None);
+        assert!(!ran.lease().is_lost());
+        // The list ran: its slots serve the next list, once.
+        assert!(ran.lease().start());
+        ran.lease().finish();
+        assert!(other.take_dynamic(&heap, key, chunk).is_some());
+        assert!(ran.lease().is_lost());
+        assert!(
+            !ran.lease().start(),
+            "a list that lost its slots must not run"
+        );
+        // Everything of the first list is free again except what the other
+        // list now holds, and nothing was given back twice.
+        assert!(ran.lease().take().is_empty());
+        assert_eq!(capacity_left(&heap), total - chunk);
+        // Another request finds no finished list left and is dropped.
+        let mut third = State::default();
+        assert_eq!(third.take_dynamic(&heap, key, total), None);
+    }
+
+    /// Free slots of the heap now (taken and released again).
+    fn capacity_left(heap: &HostHeap) -> u32 {
+        capacity(heap)
+    }
+
+    /// A list that is running when another needs room keeps its slots; a
+    /// list reset by the title gives back its own and is not taken twice.
+    #[test]
+    fn a_running_or_reset_list_is_not_taken_back() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = 0x2000_0002;
+        let total = capacity(&heap);
+        let mut running = State::default();
+        let first = running.take_dynamic(&heap, key, total).unwrap();
+        assert_eq!(first, heap.count());
+        running.lease().finish();
+        // Submitted again: it is running and cannot be taken back.
+        assert!(running.lease().start());
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, 1), None);
+        assert!(!running.lease().is_lost());
+        // It ran: now it can, whole.
+        running.lease().finish();
+        assert_eq!(other.take_dynamic(&heap, key, 1), Some(heap.count()));
+        assert!(running.lease().is_lost());
+        // A lease reset by the title (its slots taken, as `Drop` does) is
+        // skipped: nothing is held, so nothing is taken back.
+        let mut reset = State::default();
+        assert!(reset.take_dynamic(&heap, key, 1).is_some());
+        reset.lease().finish();
+        assert_eq!(reset.lease().take().len(), 1);
+        let mut last = State::default();
+        assert_eq!(last.take_dynamic(&heap, key, total), None);
+        assert!(!reset.lease().is_lost());
+    }
 }

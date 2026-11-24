@@ -119,11 +119,29 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let mut skipped = 0;
         let host_lists: Vec<_> = lists
             .iter()
+            .filter(|&&l| {
+                let may = crate::list::may_run(l);
+                skipped += usize::from(!may);
+                may
+            })
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        if skipped > 0 {
+            static LOST: AtomicBool = AtomicBool::new(false);
+            if !LOST.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                );
+            }
+        }
         host.execute(&host_lists);
+        for &l in lists {
+            crate::list::finished(l);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
