@@ -155,9 +155,45 @@ What still stops says why: `console wave64 lanes in a group of more than 64
 threads`, `ds_permute across the halves`, or `a whole-wave section` (in
 other groups), each `on a host without 64-lane waves`.
 
-Groups of several console waves still need another meeting point: a group
-barrier would wait for console waves elsewhere. The plan stays per-console-
-wave arrival counters with double-buffered slots and a bounded wait.
+### Groups of several console waves (planned)
+
+A group barrier is reached by every thread of the group only where all its
+console waves branch alike, and they need not: each console wave takes its
+`s_cbranch_*` for itself. The earlier plan was a meeting point per console
+wave (arrival counters, double-buffered slots, a bounded wait). It is
+dropped: a wait is met only if the partner half runs meanwhile, and D3D12
+promises no such thing. On an RTX 5070 the upper half of a group does not
+write LDS before the lower half reads it unless a barrier orders them, in
+20 of 20 runs (`lds_written_and_read_in_different_masked_blocks`), which is
+what waves run one after the other would give. A wait would then never be
+met, and a bounded one gives a wrong result instead of a hang.
+
+What the programs are (an offline translate over a local copy of the
+title's shaders, 43 programs stopped for their group size): groups of
+16x16x1 (15), 1024x1x1 (7), 8x16x1 (6), 256x1x1 (4), 512x1x1 (2), 128x1x1
+(2) and 32x32x1 (1). Nearly all count mask bits (`v_mbcnt`) and read a mask
+as a number; about two thirds have no LDS and no `s_barrier`.
+
+**Without LDS: one console wave per host group.** The console waves of
+such a group share nothing but the resources every group shares, so they
+can be separate host groups. The program is emitted with 64 threads per
+group, and a dispatch of (x, y, z) groups of k console waves each becomes
+(x * k, y, z) host groups: host group id x gives the console group
+(x / k) and the wave in it (x % k), the flat thread id is 64 * wave +
+the id in the host group, and the console's thread and group ids follow
+from those. Each host group is then one console wave in two host waves,
+which is the console flow as it is. Needed outside the translator: the
+emitted shader says its k, direct dispatches multiply x (within D3D12's
+65535 groups per dimension; refuse beyond), and indirect dispatches
+multiply the record's x where the indirect records are already rewritten
+(`victory-gpu`'s clamp pass).
+
+**With LDS and `s_barrier`:** the waves of a group do meet there, so they
+must stay one host group. Open; candidates are group barriers where every
+console wave provably arrives (as #189 places them) and, for the rest, a
+group-wide form in which every thread runs every block any console wave of
+its group enters, with each wave's scalars and effects guarded by whether
+that wave is really there.
 
 ### The console flow on every host
 
@@ -200,8 +236,9 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 
 1. ~~Translate for the host's wave range; cache by it; `--host-lanes`.~~
 2. ~~Adapter selection for tests and tools.~~
-3. Measure the title's programs by reason (`--host-lanes 32-32`), to
-   order steps 4 to 6.
+3. ~~Measure the title's programs by reason (`--host-lanes 32-32`), to
+   order the later steps.~~ Testers did, and from `965ce30` on a local
+   offline run does.
 4. ~~In-half programs: console-lane programs whose cross-lane operations
    all stay inside a half, with no mask read whole.~~ No new lane assignment
    was needed (see above). A later widening is LDS in multi-wave groups,
@@ -209,7 +246,10 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
-   console flow).~~ Then multi-wave groups (counters).
+   console flow).~~
+7. Multi-wave groups without LDS: one console wave per host group (the
+   translator's ids, then direct and indirect dispatch counts).
+8. Multi-wave groups with LDS.
 
 ## Credit
 
