@@ -5574,6 +5574,80 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// A 64-bit image atomic: each value a VGPR pair, low dword first, on a
+    /// 64-bit integer texture UAV (the console's R32G32 view; its handle
+    /// is tagged U32 as DXC tags one). `code` is the DXIL binary operation,
+    /// `u32::MAX` a compare-exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn image_atomic64(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        kind: u32,
+        cs: Vec<V>,
+        reg: u8,
+        guard: Option<V>,
+        op: &str,
+        code: u32,
+    ) -> Result<(), Why> {
+        let Fields::Image { cache, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
+        if matches!(src, Source::Loaded { .. }) {
+            self.s.flags |= flags::ATOMIC_INT64_HEAP;
+        }
+        let pair = |l: &mut Self, r: u8| -> Result<V, Why> {
+            let lo = l.i32_of(inst.read(Reg::V(r)).ok_or("image atomic data")?)?;
+            let hi = l.i32_of(inst.read(Reg::V(r + 1)).ok_or("image atomic data")?)?;
+            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+            let k32 = l.s.m.int_const(i64t, 32);
+            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+        };
+        // Lanes the guard skips keep their registers.
+        let old = pair(self, reg)?;
+        let mut value = old;
+        if op == "sub" {
+            let z = self.s.m.int_const(i64t, 0);
+            value = self.s.m.bin(c, Bin::Sub, z, value);
+        }
+        let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+        let at = self.begin_guarded(guard);
+        let mut args = vec![h];
+        let r = if code == u32::MAX {
+            // cmpswap: data is (new, compare), a pair each.
+            let cmp = pair(self, reg + 2)?;
+            args.extend(cs);
+            args.extend([cmp, value]);
+            self.s.op(
+                self.cur,
+                "atomicCompareExchange.i64",
+                Attr::NoUnwind,
+                i64t,
+                79,
+                &args,
+            )
+        } else {
+            args.push(self.s.m.i32(code));
+            args.extend(cs);
+            args.push(value);
+            self.s
+                .op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
+        };
+        let r = self.end_guarded(at, &[(r, old)])[0];
+        if cache.glc {
+            let (lo, hi) = self.split64(r);
+            self.write(inst, Reg::V(reg), lo, None);
+            self.write(inst, Reg::V(reg + 1), hi, None);
+        }
+        Ok(())
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -5673,12 +5747,13 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two
+            // dwords per value are a 64-bit atomic on an R32G32 view.
+            let wide = match (*dmask, code == u32::MAX) {
+                (1, false) | (3, true) => false,
+                (3, false) | (0xF, true) => true,
+                _ => return Err("an image atomic's data mask"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5687,6 +5762,9 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
+            if wide {
+                return self.image_atomic64(inst, site, src, kind, cs, reg, guard, op, code);
+            }
             let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
             let mut value = vals[0];
             if op == "sub" {
