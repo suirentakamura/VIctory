@@ -116,12 +116,21 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Diagnostics: `VICTORY_DUMP_FAILED=<dir>` keeps the
+                        // container, for `victory shader-info --disasm`.
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED") {
+                            let path = std::path::Path::new(&dir)
+                                .join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            let _ = std::fs::write(path, &self.container);
+                        }
+                    }
                 }
                 done.ok()
             })
@@ -149,6 +158,29 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+/// Diagnostics: the console resources each stage of pipeline `this` uses
+/// (stage, shader hash, resources), whether or not its shaders translate.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn native_used(this: This) -> Vec<(&'static str, String, Vec<victory_shader::UsedResource>)> {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| {
+            let used = Container::parse(&s.container)
+                .ok()
+                .and_then(|c| c.part(FourCC::DXIL).map(|p| p.data.to_vec()))
+                .and_then(|d| victory_shader::native_programs(&d).ok())
+                .map(|programs| programs.into_iter().flat_map(|p| p.used).collect())
+                .unwrap_or_default();
+            (s.stage, s.hash.clone(), used)
+        })
+        .collect()
 }
 
 #[repr(C)]
