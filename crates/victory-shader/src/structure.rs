@@ -319,6 +319,11 @@ pub struct Structured {
     /// What a program run as the console runs it, every lane through every
     /// block, guards its vector instructions with ([`structure_console`]).
     pub execs: Vec<Vec<Option<Bool>>>,
+    /// The lane's bit of values read as masks that derive from neither
+    /// EXEC nor a VALU result (constants, uniform selects, opaque ones), by
+    /// low dword. What a mask join takes on an edge such a value arrives by:
+    /// a loop's exit mask starts as a constant 0 before lanes are added.
+    pub others: HashMap<Value, Bool>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -609,6 +614,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             execs: execs.to_vec(),
+            others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
         })
     }
 

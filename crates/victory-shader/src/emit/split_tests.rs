@@ -373,3 +373,30 @@ fn lane_writes_reach_lanes_outside_the_branch() {
         if t == 40 { 77 } else { 1 }
     });
 }
+
+/// The loop form compilers emit: lanes that are done are added to an exit
+/// mask that starts as 0, EXEC loses them, and the mask restores EXEC
+/// after the loop. Lane t runs t + 1 iterations with a read of lane 40 in
+/// each; afterwards every lane has s9 = 40 and counts all 64 lanes in the
+/// exit mask.
+#[test]
+fn loops_with_an_exit_mask_grown_from_zero() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF9, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+    ];
+    console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
