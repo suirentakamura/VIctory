@@ -3966,9 +3966,8 @@ impl<'a> Lower<'a> {
     }
 
     /// `s_load_dword*` of `count` dwords from the memory at root-parameter
-    /// address `a`: through the root CBV when the title declares the
-    /// parameter a constant buffer, else through a raw root view (a root
-    /// UAV when it declares one).
+    /// address `a`, through a raw root view (a root UAV when the title
+    /// declares one there).
     fn root_smem(&mut self, inst: &Inst, site: Site, a: Address, count: u32) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
@@ -3995,8 +3994,10 @@ impl<'a> Lower<'a> {
             bits: 0,
             words: [0, 0],
         };
+        // A raw view even for a constant buffer: its offset may be computed,
+        // and the host bounds raw root views by the buffer's copy (a root
+        // CBV is unbounded there).
         let props = match kind {
-            Some(ResourceType::Cbv) => (13, 0x1_0000),
             Some(ResourceType::Uav) => (RAW_UAV, 0),
             _ => (11, 0),
         };
@@ -4010,9 +4011,7 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
-            let x = if props.0 == 13 {
-                self.cbuffer_dword(h, at)
-            } else {
+            let x = {
                 let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
                 let r = self.s.op(
                     c,
@@ -4306,7 +4305,8 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(u16::from(rp.slot)))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
+                    // A root SRV, or a root CBV's memory read as raw data.
+                    (RootType::Descriptor, Some(ResourceType::Srv | ResourceType::Cbv), 11) => {
                         Ok(self.s.root_srv_handle(u16::from(rp.slot)))
                     }
                     // A root UAV the program reads and writes as a raw

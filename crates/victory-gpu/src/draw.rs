@@ -83,7 +83,7 @@ pub(crate) struct State {
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
-    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    root_srv_slots: std::collections::HashMap<(usize, u64, bool), u32>,
 }
 
 impl Drop for State {
@@ -551,13 +551,13 @@ impl State {
                     let Some(address) = self.view_address(compute, register) else {
                         once!(register, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
                         continue;
                     };
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
+                        if !self.root_srv_table(list, Some(address), param, compute, false) {
                             return false;
                         }
                         continue;
@@ -609,11 +609,16 @@ impl State {
     /// date before the list runs, and what the shader writes is copied back
     /// after. False when the title set no address or no host copy holds it
     /// (the draw or dispatch is dropped, as before root UAVs were bound).
-    fn root_uav(&self, list: &HostList, register: u16, param: u32, compute: bool) -> bool {
+    fn root_uav(&mut self, list: &HostList, register: u16, param: u32, compute: bool) -> bool {
         let Some(address) = self.view_address(compute, register) else {
             once!(register, "a shader writes a root UAV the title did not set: dropped");
             return false;
         };
+        if crate::pipeline::host::bounded_root_srvs() {
+            // Bounded to the host copy, as root SRVs are: accesses past it
+            // would reach whatever the host placed after the buffer.
+            return self.root_srv_table(list, Some(address), param, compute, true);
+        }
         let Some(shadow) = crate::shadow::find(address, 1) else {
             once!(
                 address = format_args!("{address:#x}"),
@@ -639,17 +644,19 @@ impl State {
         true
     }
 
-    /// Binds a root SRV as a one-view table (see
+    /// Binds a root SRV, or a root UAV (`uav`), as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy). One slot per address per list.
-    /// False if no dynamic slot could be had (the draw is dropped).
+    /// view (no address, or no host copy). One slot per address and kind
+    /// per list. False if no dynamic slot could be had (the draw is
+    /// dropped).
     fn root_srv_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
+        uav: bool,
     ) -> bool {
         let Some((heap, host)) = self
             .heaps
@@ -662,7 +669,7 @@ impl State {
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0), uav);
         let index = match self.root_srv_slots.get(&key) {
             Some(&index) => index,
             None => {
@@ -676,8 +683,16 @@ impl State {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
+                        if offset.is_multiple_of(16) && uav {
+                            host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
+                        } else if offset.is_multiple_of(16) {
                             host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        } else if uav {
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                "a root UAV not on 16 bytes reads zeros and drops writes"
+                            );
+                            host.null_raw_uav_at(index);
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.
@@ -688,13 +703,20 @@ impl State {
                             host.null_raw_at(index);
                         }
                     }
+                    None if uav => host.null_raw_uav_at(index),
                     None => host.null_raw_at(index),
                 }
                 index
             }
         };
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+            if uav {
+                let len = s.left(*a).min(ROOT_UAV_SPAN);
+                s.refresh(list, *a, len);
+                s.gpu_writes(list, *a, len);
+            } else {
+                s.refresh(list, *a, s.left(*a).min(1 << 20));
+            }
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
