@@ -77,14 +77,14 @@ pub(crate) struct State {
     /// The dynamic slots the list holds (title heap, first, count), given
     /// back when the list is reset or released, or earlier when a heap runs
     /// short after the list ran (see [`crate::descriptor::lease`]).
-    lease: std::sync::Arc<crate::descriptor::lease::Lease>,
+    dynamic: std::sync::Arc<crate::descriptor::lease::Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for (heap, first, n) in self.lease.take() {
+        for (heap, first, n) in self.dynamic.take() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -175,7 +175,7 @@ impl State {
 
     /// The list's slots, to start and finish its submissions.
     pub(crate) fn lease(&self) -> &std::sync::Arc<crate::descriptor::lease::Lease> {
-        &self.lease
+        &self.dynamic
     }
 
     /// `n` consecutive dynamic slots of `host` (the host heap of the title
@@ -191,7 +191,7 @@ impl State {
         let mut reclaimed = false;
         loop {
             if let Some(first) = host.dynamic(n) {
-                self.lease.add(key, first, n);
+                self.dynamic.add(key, first, n);
                 return Some(first);
             }
             let more = crate::descriptor::lease::reclaim(key, |(heap, first, n)| {

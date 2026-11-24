@@ -42,10 +42,16 @@ fn finished_queue() -> std::sync::MutexGuard<'static, VecDeque<Arc<Lease>>> {
 impl Lease {
     /// Records a range the list took.
     pub(crate) fn add(&self, heap: usize, first: u32, n: u32) {
+        self.push((heap, first, n));
+    }
+
+    /// As [`Lease::add`], for a range as a tuple: a list's `dynamic` slots
+    /// were a `Vec` of them, and code written for that still compiles.
+    pub(crate) fn push(&self, range: Range) {
         self.ranges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((heap, first, n));
+            .push(range);
     }
 
     /// Everything the list still holds, to give back (the list is reset or
