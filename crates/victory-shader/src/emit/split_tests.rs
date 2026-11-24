@@ -69,6 +69,14 @@ const IN_HALF: &[u32] = &[
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
+    // The validator, where one is installed: drivers take some modules it
+    // refuses.
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut cs.dxil.clone())
+            .map_err(|e| format!("validation: {e}"))?;
+    }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
     let StageIo::Cs(io) = &native.io else {
