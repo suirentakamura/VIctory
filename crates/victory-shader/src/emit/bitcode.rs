@@ -126,7 +126,7 @@ pub(crate) mod pred {
 }
 
 #[derive(Debug, Clone)]
-enum Op {
+pub(super) enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
     Cmp(u8, V, V),
@@ -146,9 +146,9 @@ enum Op {
 }
 
 #[derive(Debug, Clone)]
-struct Inst {
-    ty: Ty,
-    op: Op,
+pub(super) struct Inst {
+    pub(super) ty: Ty,
+    pub(super) op: Op,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,10 +159,10 @@ pub(crate) enum Term {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Block {
-    phis: Vec<u32>,
-    body: Vec<u32>,
-    term: Option<Term>,
+pub(super) struct Block {
+    pub(super) phis: Vec<u32>,
+    pub(super) body: Vec<u32>,
+    pub(super) term: Option<Term>,
 }
 
 /// Function attributes of a `dx.op` declaration.
@@ -201,8 +201,8 @@ pub(crate) struct Module {
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
-    insts: Vec<Inst>,
-    blocks: Vec<Block>,
+    pub(super) insts: Vec<Inst>,
+    pub(super) blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
 }
@@ -368,6 +368,22 @@ impl Module {
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
         self.blocks[block].body.push(i);
+        V::Inst(i)
+    }
+
+    /// The name of the function instruction `i` calls, if it is a call.
+    pub(super) fn callee(&self, i: u32) -> Option<&str> {
+        match &self.insts[i as usize].op {
+            Op::Call(f, _) => Some(&self.funcs[*f as usize].name),
+            _ => None,
+        }
+    }
+
+    /// An instruction at position `at` of `block`'s body.
+    pub(super) fn insert(&mut self, block: usize, at: usize, ty: Ty, op: Op) -> V {
+        let i = self.insts.len() as u32;
+        self.insts.push(Inst { ty, op });
+        self.blocks[block].body.insert(at, i);
         V::Inst(i)
     }
 

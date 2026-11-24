@@ -538,6 +538,9 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // Structured control flow, for translators that need it (see
+        // `structurize`).
+        super::structurize::structurize(&mut self.m);
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());

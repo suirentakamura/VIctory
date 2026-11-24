@@ -84,6 +84,7 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+mod structurize;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -277,6 +278,16 @@ pub fn emit(
         prims,
         mesh_stride,
     })?;
+    #[cfg(feature = "diagnostics")]
+    if let Some(dir) = std::env::var_os("VICTORY_DXIL_DUMP") {
+        // Named by an FNV-1a hash of the emitted container.
+        let name = l.dxil.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+        let stage = format!("{:?}", native.stage).to_lowercase();
+        let path = std::path::Path::new(&dir).join(format!("{stage}-{name:016x}.dxil"));
+        let _ = std::fs::write(path, &l.dxil);
+    }
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
