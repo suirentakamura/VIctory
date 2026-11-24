@@ -281,7 +281,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex (or mesh), then pixel, then geometry stage, or the compute
+    /// stage.
     pub(crate) stages: Vec<Stage>,
     /// A graphics pipeline of the console's rectangle lists whose geometry
     /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
@@ -306,8 +307,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// A host pipeline for vertex (or mesh), geometry and pixel shaders
+    /// with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
@@ -317,14 +318,27 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "geometry" | "pixel" | "mesh"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry").filter(|_| compute.is_none());
+        if geometry.is_some() && mesh.is_some() {
+            return refuse("a geometry shader in a mesh pipeline", shaders);
+        }
+        // Rectangle lists are completed by a geometry shader of the host's
+        // own (below): the host has one geometry stage, and the two are not
+        // chained.
+        if geometry.is_some() && g.is_some_and(|g| g.topology.0 == RECTANGLES) {
+            return refuse(
+                "a geometry shader drawing rectangle lists (both need the host's geometry stage)",
+                shaders,
+            );
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -335,6 +349,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -489,14 +504,21 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Stage 0 is the first; the pixel and geometry stages by name (either
+        // may be missing).
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
+            let stage = match i {
+                0 => stages.first(),
+                1 => stages.iter().find(|(s, _)| s.stage == "pixel"),
+                _ => stages.iter().find(|(s, _)| s.stage == "geometry"),
+            };
+            let translated = stage.and_then(|(s, _)| s.translated());
+            translated.map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
                     BytecodeLength: t.host.dxil.len(),
-                },
-            )
+                }
+            })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -571,8 +593,11 @@ impl HostPipeline {
 
         // Rectangle lists: a geometry shader made for the vertex shader adds
         // each rectangle's fourth corner (else rectangles are expanded on
-        // the CPU from vertex inputs, see `draw`).
+        // the CPU from vertex inputs, see `draw`). A title's own geometry
+        // shader takes the stage instead (never both, see above).
+        let title_gs = code_bytes(&code(2));
         let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+            _ if !title_gs.is_empty() => title_gs,
             (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
@@ -629,7 +654,8 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
+        let rectangles = geometry.is_none() && !gs.is_empty();
+        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -647,7 +673,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
-            rectangles: !gs.is_empty(),
+            rectangles,
             slots: g.slots(),
             inputs: g.elements(),
         })
