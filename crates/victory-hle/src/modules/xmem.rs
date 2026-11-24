@@ -780,77 +780,8 @@ fn shows(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder, as one view with the neighbouring views
-/// that continue it.
+/// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    if !map_one(physical, base, len, slice) {
-        return false;
-    }
-    join(physical, base);
-    true
-}
-
-/// Joins the view at `base` with neighbours showing the section pages just
-/// before and after its own. Titles map pages one at a time (tens of
-/// thousands of views in the world), and under Wine every view mapped or
-/// unmapped is a wineserver request that walks all of them.
-fn join(physical: &mut Physical, base: usize) {
-    let Some((len, slice)) = physical.views.get(&base).cloned() else {
-        return;
-    };
-    let follows = |a: &Slice, pages: usize, b: &Slice| {
-        Arc::ptr_eq(&a.section, &b.section) && a.index + pages == b.index
-    };
-    let left = (physical.views.range(..base).next_back())
-        .filter(|(at, (n, s))| *at + n == base && follows(s, n / PAGE, &slice))
-        .map(|(at, (n, s))| (*at, *n, s.clone()));
-    let right = (physical.views.get(&(base + len)))
-        .filter(|(_, s)| follows(&slice, len / PAGE, s))
-        .map(|(n, _)| *n);
-    if left.is_none() && right.is_none() {
-        return;
-    }
-    let mut parts: Vec<(usize, usize, Slice)> = left.into_iter().collect();
-    parts.push((base, len, slice));
-    if let Some(n) = right {
-        let s = physical.views[&(base + len)].1.clone();
-        parts.push((base + len, n, s));
-    }
-    for (at, _, _) in &parts {
-        physical.views.remove(at);
-        view_churn(false, physical.views.len());
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: *at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
-    }
-    let (start, end) = (parts[0].0, base + len + right.unwrap_or(0));
-    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
-    // SAFETY: exactly the placeholders just left by our views.
-    let joined = unsafe {
-        VirtualFree(
-            start as *mut c_void,
-            end - start,
-            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
-        )
-    } != 0;
-    if joined && map_one(physical, start, end - start, parts[0].2.clone()) {
-        return;
-    }
-    // Back as they were.
-    for (at, n, s) in parts {
-        map_one(physical, at, n, s);
-    }
-}
-
-/// [`map`] without joining.
-fn map_one(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1212,62 +1143,6 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
-    }
-
-    /// Pages mapped one at a time next to the section pages they follow
-    /// become one view; unmapping one of them keeps the others.
-    #[test]
-    fn pages_mapped_one_by_one_join_into_one_view() {
-        let mut pages = [0usize; 3];
-        let mut n = 3;
-        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
-        let a = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            3 * PAGE,
-            MEM_RESERVE | PAGES_64K,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!a.is_null());
-        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
-        let view = |p: *mut c_void| {
-            let physical = physical();
-            physical
-                .views
-                .range(..=p as usize)
-                .next_back()
-                .map(|(base, (len, _))| (*base, *len))
-        };
-        for i in [0, 2, 1] {
-            assert_eq!(
-                XMemMapPhysicalPagesScatter([at(i)].as_ptr(), 1, pages[i..].as_ptr()),
-                1
-            );
-        }
-        assert_eq!(view(at(2)), Some((a as usize, 3 * PAGE)), "one view");
-        // SAFETY: mapped read-write.
-        unsafe {
-            at(0).cast::<u8>().write(3);
-            at(2).cast::<u8>().write(5);
-        }
-        assert_eq!(
-            XMemMapPhysicalPagesScatter([at(1)].as_ptr(), 1, std::ptr::null()),
-            1
-        );
-        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
-        // SAFETY: still mapped.
-        unsafe {
-            assert_eq!(at(0).cast::<u8>().read(), 3);
-            assert_eq!(at(2).cast::<u8>().read(), 5);
-        }
-        // Mapped back, it joins again and shows the same bytes.
-        assert_eq!(
-            XMemMapPhysicalPagesScatter([at(1)].as_ptr(), 1, pages[1..].as_ptr()),
-            1
-        );
-        assert_eq!(view(at(0)), Some((a as usize, 3 * PAGE)));
-        // SAFETY: mapped read-write.
-        assert_eq!(unsafe { at(2).cast::<u8>().read() }, 5);
     }
 
     #[test]
