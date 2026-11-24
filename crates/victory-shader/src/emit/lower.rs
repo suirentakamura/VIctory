@@ -5616,7 +5616,17 @@ impl<'a> Lower<'a> {
             let z = self.s.m.int_const(i64t, 0);
             value = self.s.m.bin(c, Bin::Sub, z, value);
         }
-        let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+        // A heap handle of its own: `handle` keys its cache by resource kind
+        // only, so a float4 handle of the same view (a size query, say)
+        // would come back with the wrong element type.
+        let props = (kind | 0x1000, 0x105);
+        let h = match src {
+            Source::Loaded { load, first } => {
+                let index = self.heap_index(*load, *first, false)?;
+                self.s.heap_handle(self.cur, index, false, props)
+            }
+            _ => self.handle(site, src, false, props)?,
+        };
         let at = self.begin_guarded(guard);
         let mut args = vec![h];
         let r = if code == u32::MAX {
