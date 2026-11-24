@@ -392,9 +392,19 @@ uint f32_to_half(float v) {
     int ex = (int)((bits >> 23u) & 0xffu) - 127 + 15;
     uint man = bits & 0x7fffffu;
     if (ex >= 31) return sgn | 0x7c00u;
-    if (ex <= 0) return sgn;
+    if (ex <= 0) {
+        // Half subnormals, rounded to even, as primitive.rs makes them.
+        if (ex < -10) return sgn;
+        uint sig = (1u << 23) | man;
+        uint shift = (uint)(14 - ex);
+        uint halfway = 1u << (shift - 1u);
+        uint q = sig >> shift;
+        uint r = sig & ((1u << shift) - 1u);
+        bool up = r > halfway || (r == halfway && (q & 1u) != 0u);
+        return sgn | (q + (up ? 1u : 0u));
+    }
     // Added, not or-ed: a rounding carry out of the mantissa raises the
-    // exponent (as #260 does for primitive.rs).
+    // exponent, as in primitive.rs.
     return sgn | (((uint)ex << 10u) + ((man + 0x1000u) >> 13u));
 }
 
@@ -986,7 +996,8 @@ mod tests {
         };
         // 3 rectangles (9 vertices total):
         // Rect 0: standard full-screen quad
-        // Rect 1: negative/clamped colors and negative half-floats
+        // Rect 1: clamped colors, negative half-floats (u) and a half
+        // subnormal fourth corner (v)
         // Rect 2: used by record 1 starting at vertex 6
         let src_bytes: Vec<u8> = [
             // Rect 0 (verts 0..3)
@@ -1024,8 +1035,8 @@ mod tests {
             vertex(
                 0.25,
                 0.5,
-                0x3800,
-                0xc000,
+                0xb800,
+                0x0400, // with 0x0600 and 0x0300 below: v3 = 2^-16, a half subnormal
                 50000,
                 1000,
                 [220, 10, 128, 64],
@@ -1034,8 +1045,8 @@ mod tests {
             vertex(
                 0.25,
                 -0.5,
-                0x3c00,
                 0xbc00,
+                0x0600,
                 10000,
                 20000,
                 [50, 200, 250, 200],
@@ -1044,8 +1055,8 @@ mod tests {
             vertex(
                 2.5,
                 -0.5,
-                0x4000,
-                0x3e00,
+                0xc000,
+                0x0300,
                 60000,
                 5000,
                 [200, 20, 10, 100],
