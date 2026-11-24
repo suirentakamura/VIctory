@@ -464,11 +464,12 @@ fn one_wave_shares_lds_in_instruction_order() {
 /// half's read of the lower half's dword can come first. Lane t writes t to
 /// dword t and reads dword 63 - t.
 ///
-/// On an RTX 5070 both LDS tests also pass with the barrier before each LDS
-/// access left out: that card keeps the two waves in step for these
-/// programs. They check that the form gives the console's result, not that
-/// the barrier is what gives it; D3D12 promises no order between a group's
-/// waves without one.
+/// On an RTX 5070 this test and the one above also pass with the barrier
+/// before each LDS access left out: that card keeps the two waves in step
+/// for these programs. They check that the form gives the console's result,
+/// not that the barrier is what gives it; D3D12 promises no order between a
+/// group's waves without one. `lds_written_and_read_in_different_masked_blocks`
+/// has a case that does fail without it.
 #[test]
 fn lds_order_holds_when_one_half_is_busy() {
     let mut body = vec![
@@ -658,4 +659,108 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
             "{threads} threads"
         );
     }
+}
+
+/// One console wave whose LDS write and read sit in different exec-masked
+/// blocks (the pattern measured on upstream PR #189): lanes write dword t,
+/// then lanes 0..31 read dword t + 32 in a later masked block. The console
+/// runs the wave in lockstep, so the read sees the write.
+///
+/// `delay` has only lanes 32..63 write, after 4096 iterations of a
+/// scalar-counted loop in their own masked block, so a lower half that was
+/// not held back would read first.
+///
+/// In the console flow both halves are in step here twice over: a branch on
+/// EXEC is decided by both halves through an exchange, which is a group
+/// barrier, and each LDS access has a group barrier before it. So these two
+/// also pass on an RTX 5070 with the second left out; the case without
+/// branches in the test below does not.
+fn lds_across_masked_blocks(delay: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x7E04_0287, // v_mov_b32 v2, 7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_0087, // v_add_nc_u32 v5, 7, v0
+    ];
+    if delay {
+        body.extend_from_slice(&[
+            0x7D82_009F, // v_cmp_lt_u32 vcc, 31, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_000A, // s_cbranch_execz join
+            0xBE89_0380, // s_mov_b32 s9, 0
+            // loop:
+            0x160A_0AFF,
+            40503,       // v_mul_u32_u24 v5, 40503, v5
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x8109_8109, // s_add_i32 s9, s9, 1
+            0xBF0A_FF09,
+            4096,        // s_cmp_lt_u32 s9, 4096
+            0xBF85_FFF9, // s_cbranch_scc1 loop
+            0xD834_0000,
+            0x0000_0504, // ds_write_b32 v4, v5
+            // join:
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        ]);
+    } else {
+        body.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0504, // ds_write_b32 v4, v5
+        ]);
+    }
+    body.extend_from_slice(&[
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0002, // s_cbranch_execz join
+        0xD8D8_0080,
+        0x0200_0004, // ds_read_b32 v2, v4 offset:128
+        // join:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ]);
+    body
+}
+
+#[test]
+fn lds_written_and_read_in_different_masked_blocks() {
+    program_case(
+        "LDS written by every lane, then read by the lower half",
+        &program_lds(&lds_across_masked_blocks(false), 64),
+        |t| if t < 32 { t + 39 } else { 7 },
+        true,
+    );
+    // What a writer leaves: 4096 times v = v_mul_u32_u24(40503, v) + 1.
+    let late = |t: u32| {
+        (0..4096).fold(t + 7, |v, _| {
+            (v & 0xFF_FFFF).wrapping_mul(40503).wrapping_add(1)
+        })
+    };
+    program_case(
+        "LDS written late by the upper half, then read by the lower",
+        &program_lds(&lds_across_masked_blocks(true), 64),
+        |t| if t < 32 { late(t + 32) } else { 7 },
+        true,
+    );
+    // The same masks with no branch around either access: nothing but the
+    // barrier before each LDS access orders the halves. With it left out,
+    // the lower half of an RTX 5070 reads 0 here every time (20 of 20 runs):
+    // this is the case that shows the barrier is needed.
+    let masked = [
+        0x7E04_0287, // v_mov_b32 v2, 7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_0087, // v_add_nc_u32 v5, 7, v0
+        0x7D82_009F, // v_cmp_lt_u32 vcc, 31, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD8D8_0080,
+        0x0200_0004, // ds_read_b32 v2, v4 offset:128
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    program_case(
+        "LDS written by the upper half and read by the lower, no branches",
+        &program_lds(&masked, 64),
+        |t| if t < 32 { t + 39 } else { 7 },
+        true,
+    );
 }
