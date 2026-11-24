@@ -165,6 +165,24 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
+    /// A compute program whose root arguments all sit past the 16 user SGPRs
+    /// finds them through the spill table `s[0:1]` points to; `ir::build_with`
+    /// then reads them as user SGPRs 16 and up. Only when the hardware
+    /// initializes nothing from s16 on: with 16 user SGPRs the thread-group
+    /// ids would sit there too and be taken for root arguments, so such a
+    /// program is left to fail as it does without the rule.
+    pub fn spills_root_args(&self) -> bool {
+        let StageIo::Cs(cs) = &self.io else {
+            return false;
+        };
+        !self.layout.is_empty()
+            && self
+                .layout
+                .iter()
+                .all(|r| self.stage.user_sgpr(r.user_data) >= 16)
+            && cs.initialized_sgprs() <= 16
+    }
+
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
@@ -1019,5 +1037,40 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+    /// The spill rule reads root arguments as SGPRs 16 and up, so it applies
+    /// only when the hardware puts nothing of its own there: with 16 user
+    /// SGPRs, the thread-group id would land in s16.
+    #[test]
+    fn root_args_spill_only_with_s16_free() {
+        let program = |rsrc2: u32| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 8,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2,
+                threads: [64, 1, 1],
+            }),
+            code: vec![],
+        };
+        // 2 user SGPRs, then the group id x in s2.
+        assert!(program(2 << 1 | 1 << 7).spills_root_args());
+        // 16 user SGPRs and no system SGPRs: s16 is free.
+        assert!(program(16 << 1).spills_root_args());
+        // 16 user SGPRs, then the group id x in s16.
+        assert!(!program(16 << 1 | 1 << 7).spills_root_args());
+        // A root argument below user data 16 is passed in its SGPR.
+        let mut low = program(2 << 1);
+        low.layout[0].user_data = 4;
+        assert!(!low.spills_root_args());
     }
 }

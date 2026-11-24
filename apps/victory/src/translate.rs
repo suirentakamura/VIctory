@@ -346,7 +346,7 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.spills_root_args()) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
