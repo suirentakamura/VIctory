@@ -317,6 +317,17 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether draws and dispatches that write root UAVs run. Off unless
+/// `VICTORY_ROOT_UAVS=1`: the title's BVH builder writes its nodes through
+/// root UAVs in a chain of dispatches, and while some of its stages do not
+/// translate (their dispatches dropped), the later ones read node lists
+/// nobody wrote and store nodes at offsets taken from them, over title
+/// memory past their buffers.
+pub(crate) fn root_uavs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_UAVS").is_some_and(|v| v == "1"))
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,

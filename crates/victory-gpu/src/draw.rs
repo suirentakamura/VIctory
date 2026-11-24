@@ -610,6 +610,10 @@ impl State {
     /// after. False when the title set no address or no host copy holds it
     /// (the draw or dispatch is dropped, as before root UAVs were bound).
     fn root_uav(&mut self, list: &HostList, register: u16, param: u32, compute: bool) -> bool {
+        if !crate::pipeline::host::root_uavs_enabled() {
+            once!("a shader writes a root UAV, off without VICTORY_ROOT_UAVS=1: dropped");
+            return false;
+        }
         let Some(address) = self.view_address(compute, register) else {
             once!(register, "a shader writes a root UAV the title did not set: dropped");
             return false;
