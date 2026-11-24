@@ -9665,6 +9665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
         // dword 16) and a root constant at s1: entry 0 if s1 is 0, else

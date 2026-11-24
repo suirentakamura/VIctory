@@ -408,7 +408,17 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(find("pixel").map(|ps| {
+                // A refused pixel shader would drop the geometry with it:
+                // draw it with the stand-in instead (Linux branch, on by
+                // default; VICTORY_NO_STAND_IN_PIXEL=1 turns it off).
+                if crate::pipeline::stand_in_pixels() && ps.translated().is_none() {
+                    tracing::info!(pixel = %ps.hash, "a refused pixel shader is drawn with the stand-in");
+                    (crate::pipeline::stand_in_pixel(), D3D12_SHADER_VISIBILITY_PIXEL)
+                } else {
+                    (ps, D3D12_SHADER_VISIBILITY_PIXEL)
+                }
+            }));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {

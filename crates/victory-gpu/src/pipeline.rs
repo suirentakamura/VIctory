@@ -106,6 +106,37 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+/// Whether a refused pixel shader is replaced by a stand-in so its
+/// pipelines still draw their geometry (depth, shape, a flat placeholder
+/// colour in target 0). On unless `VICTORY_NO_STAND_IN_PIXEL` is set.
+#[cfg(windows)]
+pub(crate) fn stand_in_pixels() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_STAND_IN_PIXEL").is_none())
+}
+
+/// The stand-in pixel shader: reads nothing, writes zeros to target 0.
+#[cfg(windows)]
+pub(crate) fn stand_in_pixel() -> &'static Arc<Shader> {
+    static STAND_IN: OnceLock<Arc<Shader>> = OnceLock::new();
+    STAND_IN.get_or_init(|| {
+        let translated = OnceLock::new();
+        let _ = translated.set(Some(Translated {
+            host: victory_shader::emit::host::stub_ps(),
+            used: Vec::new(),
+        }));
+        Arc::new(Shader {
+            stage: "pixel",
+            hash: "stand-in-pixel".to_owned(),
+            container: Vec::new(),
+            translated,
+            // Not a console program: no waves to skip.
+            #[cfg(feature = "diagnostics")]
+            wave64: OnceLock::from(false),
+        })
+    })
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
