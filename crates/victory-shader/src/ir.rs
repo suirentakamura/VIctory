@@ -203,6 +203,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         });
     }
     split_irreducible(&mut blocks)?;
+    duplicate_tails(&mut blocks);
 
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
@@ -489,6 +490,127 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             });
         }
         link(blocks);
+    }
+}
+
+/// Instructions a tail may hold, in all, to be copied.
+const TAIL_LIMIT: usize = 160;
+
+/// Tail duplication, before SSA. A block several blocks branch to that does
+/// not close the selection its dominator opens (some path from there ends
+/// the program without it), and whose every path ends the program without
+/// a loop (the console's shared store-and-end code that branches at
+/// different depths jump to), is copied
+/// for each of its predecessors but the first, with all it reaches. The
+/// result is a tree of selections ending in returns. Shared tails are
+/// unstructured merges: translators that need structured control flow
+/// (vkd3d-proton's DXIL-to-SPIR-V) wrap them in loops run once, and nested
+/// ones they get wrong (two loops given one merge block), which the Vulkan
+/// driver then rejects. The copies run the same instructions, so behaviour
+/// is unchanged.
+fn duplicate_tails(blocks: &mut Vec<Block>) {
+    let limit = 4 * blocks.len() + 64;
+    loop {
+        let order = reverse_postorder(blocks);
+        let mut index = vec![usize::MAX; blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            index[b] = i;
+        }
+        // Everything `b` reaches, if that is loop-free and small enough.
+        let tail = |b: usize| -> Option<Vec<usize>> {
+            let mut seen = vec![false; blocks.len()];
+            let mut out = Vec::new();
+            let mut stack = vec![b];
+            let mut size = 0;
+            while let Some(x) = stack.pop() {
+                if seen[x] {
+                    continue;
+                }
+                seen[x] = true;
+                out.push(x);
+                size += blocks[x].insts.len();
+                if size > TAIL_LIMIT || matches!(blocks[x].exit, Exit::Indirect) {
+                    return None;
+                }
+                for s in blocks[x].exit.successors() {
+                    // A back edge: a loop.
+                    if index[s] <= index[x] {
+                        return None;
+                    }
+                    stack.push(s);
+                }
+            }
+            Some(out)
+        };
+        let preds = |b: usize| {
+            let mut p: Vec<usize> = blocks[b]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| index[q] != usize::MAX)
+                .collect();
+            p.sort_by_key(|&q| index[q]);
+            p.dedup();
+            p
+        };
+        let idom = idoms(blocks, &order, &index);
+        // Whether some path from `d` ends the program without passing `m`:
+        // then `m` joins branches of different selections (a structured
+        // join post-dominates the branch it closes, and stays shared).
+        let unstructured = |d: usize, m: usize| {
+            let mut seen = vec![false; blocks.len()];
+            let mut stack = vec![d];
+            while let Some(x) = stack.pop() {
+                if x == m || seen[x] {
+                    continue;
+                }
+                seen[x] = true;
+                if matches!(blocks[x].exit, Exit::End) {
+                    return true;
+                }
+                stack.extend(blocks[x].exit.successors());
+            }
+            false
+        };
+        // The latest such block in reverse postorder: inner tails first.
+        let Some((b, region, from)) = order.iter().rev().find_map(|&b| {
+            let from = preds(b);
+            if b == 0 || from.len() < 2 || !unstructured(idom[b], b) {
+                return None;
+            }
+            tail(b).map(|region| (b, region, from))
+        }) else {
+            return;
+        };
+        if blocks.len() + region.len() * (from.len() - 1) > limit {
+            return;
+        }
+        for &p in &from[1..] {
+            let mut copy = vec![usize::MAX; blocks.len()];
+            for (i, &r) in region.iter().enumerate() {
+                copy[r] = blocks.len() + i;
+            }
+            let to = |s: usize| if copy[s] == usize::MAX { s } else { copy[s] };
+            for &r in &region {
+                let mut block = blocks[r].clone();
+                retarget(&mut block.exit, &to);
+                blocks.push(block);
+            }
+            let entry = copy[b];
+            retarget(&mut blocks[p].exit, &|s| if s == b { entry } else { s });
+        }
+        link(blocks);
+    }
+}
+
+fn retarget(exit: &mut Exit, to: &dyn Fn(usize) -> usize) {
+    match exit {
+        Exit::Jump(s) => *s = to(*s),
+        Exit::Branch { taken, not_taken } => {
+            *taken = to(*taken);
+            *not_taken = to(*not_taken);
+        }
+        Exit::End | Exit::Indirect => {}
     }
 }
 
