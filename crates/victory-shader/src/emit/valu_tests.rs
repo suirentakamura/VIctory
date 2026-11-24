@@ -969,10 +969,11 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-/// Builds, validates and runs a 32-thread Wave32 compute shader (with zero LDS
-/// allocated) where `body` leaves each lane's result in `v3`, stored to dword
-/// `threadIdInGroup.x` of a 32-dword raw UAV.
-fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
+/// Builds, validates and runs a single-wave compute shader (`32` threads in
+/// Wave32, `64` in Wave64, with zero LDS allocated) where `body` leaves each
+/// lane's result in `v3`, stored to dword `threadIdInGroup.x` of a raw UAV.
+fn run_wave_cs(wave64: bool, body: &[u32], mut check: impl FnMut(&str, &[u32])) {
+    let wave = if wave64 { 64 } else { 32 };
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -986,7 +987,7 @@ fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 12,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -1008,15 +1009,16 @@ fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs, lds_bytes = 0
-            threads: [32, 1, 1],
+            threads: [wave, 1, 1],
         }),
         code,
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -1054,9 +1056,9 @@ fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
         };
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
-            // WARP does not support fixed WaveSize(32).
-            Err(e) if warp => {
-                eprintln!("{label}: skipped fixed wave size 32 ({e})");
+            // WARP does not support fixed WaveSize, and 32-lane GPUs reject WaveSize(64).
+            Err(e) if warp || wave64 => {
+                eprintln!("{label}: skipped fixed wave size {wave} ({e})");
                 continue;
             }
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
@@ -1068,7 +1070,7 @@ fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::RawUav(32)],
+                    views: &[View::RawUav(wave)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -1078,7 +1080,7 @@ fn run_wave32_cs(body: &[u32], mut check: impl FnMut(&str, &[u32])) {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no SM 6.6 Wave32 device available; DXIL validation only");
+        eprintln!("no SM 6.6 Wave{wave} device available; DXIL validation only");
     }
 }
 
@@ -1098,7 +1100,7 @@ fn ds_bpermute_b32_gathers_with_offset_and_wrap() {
     ];
     body.extend_from_slice(&ds_bpermute_b32(3, 2, 1, 12));
 
-    run_wave32_cs(&body, |backend, got| {
+    run_wave_cs(false, &body, |backend, got| {
         for (t, &val) in got.iter().enumerate() {
             let src = ((31 - t as u32) + 3) & 31;
             let want = 0x1000 + src;
@@ -1134,7 +1136,7 @@ fn ds_bpermute_b32_zeroes_inactive_source_and_preserves_inactive_dst() {
     body.extend_from_slice(&ds_bpermute_b32(3, 2, 1, 0));
     body.push(sop1(0x03, 0x7E, 6)); // s_mov_b32 exec_lo, s6
 
-    run_wave32_cs(&body, |backend, got| {
+    run_wave_cs(false, &body, |backend, got| {
         for (t, &val) in got.iter().enumerate() {
             let t = t as u32;
             let want = if t < 8 {
@@ -1171,7 +1173,7 @@ fn ds_bpermute_b32_divergent_branch_zeroes_skipped_lanes() {
     body.extend_from_slice(&ds_bpermute_b32(3, 2, 1, 0));
     body.push(sop1(0x03, 0x7E, 6)); // s_mov_b32 exec_lo, s6
 
-    run_wave32_cs(&body, |backend, got| {
+    run_wave_cs(false, &body, |backend, got| {
         for (t, &val) in got.iter().enumerate() {
             let t = t as u32;
             let want = if t < 8 {
@@ -1184,6 +1186,75 @@ fn ds_bpermute_b32_divergent_branch_zeroes_skipped_lanes() {
             assert_eq!(
                 val, want,
                 "{backend}: lane {t} got {val:#010x}, want {want:#010x}",
+            );
+        }
+    });
+}
+
+#[test]
+fn ds_bpermute_b32_wave64_stays_within_each_32_lane_half() {
+    // RDNA 2 wave64 permutes lanes 0..31 and 32..63 independently (section 10.4):
+    //   v1 = 0x4000 + t
+    //   v2 = (t & 31) << 2    (lane 32 passes byte addr 0)
+    //   ds_bpermute_b32 v3, v2, v1 offset:12
+    // Lower half wraps 29..31 -> 0..2; upper half gathers 35..63 and wraps 61..63 -> 32..34.
+    let mut body = vec![
+        vop2(0x25, 1, 0xFF, 0),      // v_add_nc_u32 v1, 0x4000, v0
+        0x4000,                      // literal
+        vop2(0x1B, 2, 0x80 + 31, 0), // v_and_b32 v2, 31, v0
+        vop2(0x1A, 2, 0x80 + 2, 2),  // v_lshlrev_b32 v2, 2, v2
+    ];
+    body.extend_from_slice(&ds_bpermute_b32(3, 2, 1, 12));
+
+    run_wave_cs(true, &body, |backend, got| {
+        for (t, &val) in got.iter().enumerate() {
+            let t = t as u32;
+            let src = (t & !31) | ((t + 3) & 31);
+            let want = 0x4000 + src;
+            assert_eq!(
+                val, want,
+                "{backend}: wave64 lane {t} got {val:#x}, want {want:#x} (from lane {src})",
+            );
+        }
+    });
+}
+
+#[test]
+fn ds_bpermute_b32_wave64_exec_mask_per_half() {
+    // Active lanes 0..39 in wave64:
+    //   v1 = 0x5000 + t, v3 = 0xCAFE_0000 + t, v2 = ((t + 8) & 31) << 2
+    //   - lanes 0..31:  all active, gather from lower half (t + 8) & 31
+    //   - lanes 32..39: active, pull from upper-half lanes 40..47 (inactive -> 0,
+    //                   even though lower-half lanes 8..15 are active)
+    //   - lanes 40..63: inactive -> preserve 0xCAFE_0000 + t
+    let mut body = vec![
+        vop2(0x25, 1, 0xFF, 0),      // v_add_nc_u32 v1, 0x5000, v0
+        0x5000,                      // literal
+        vop2(0x25, 3, 0xFF, 0),      // v_add_nc_u32 v3, 0xCAFE_0000, v0
+        0xCAFE_0000,                 // literal
+        vop2(0x25, 2, 0x80 + 8, 0),  // v_add_nc_u32 v2, 8, v0
+        vop2(0x1B, 2, 0x80 + 31, 2), // v_and_b32 v2, 31, v2
+        vop2(0x1A, 2, 0x80 + 2, 2),  // v_lshlrev_b32 v2, 2, v2
+        vop1(0x001, 5, 0x80 + 40),   // v_mov_b32 v5, 40
+        vopc(0xC1, vgpr(0), 5),      // v_cmp_lt_u32 vcc, v0, v5
+        sop1(0x24, 6, 0x6A),         // s_and_saveexec_b64 s[6:7], vcc
+    ];
+    body.extend_from_slice(&ds_bpermute_b32(3, 2, 1, 0));
+    body.push(sop1(0x04, 0x7E, 6)); // s_mov_b64 exec, s[6:7]
+
+    run_wave_cs(true, &body, |backend, got| {
+        for (t, &val) in got.iter().enumerate() {
+            let t = t as u32;
+            let want = if t < 32 {
+                0x5000 + ((t + 8) & 31)
+            } else if t < 40 {
+                0
+            } else {
+                0xCAFE_0000 + t
+            };
+            assert_eq!(
+                val, want,
+                "{backend}: wave64 lane {t} got {val:#010x}, want {want:#010x}",
             );
         }
     });

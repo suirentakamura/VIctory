@@ -2134,8 +2134,9 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward (pull) permute: each active lane reads `data0` from
-            // lane `((addr + offset) >> 2) & (wave - 1)`, or 0 if that source
-            // lane is inactive. Uses the DS crossbar without LDS memory.
+            // lane `((addr + offset) >> 2) & 31` within its own 32-lane half
+            // (RDNA 2 ISA, section 10.4), or 0 if that source lane is
+            // inactive. Uses the DS crossbar without LDS memory.
             self.cross_lane(false)?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -2147,8 +2148,16 @@ impl<'a> Lower<'a> {
             };
             let two = self.s.m.i32(2);
             let shifted = self.s.m.bin(c, Bin::LShr, at, two);
-            let mask = self.s.m.i32(if self.x.native.wave64 { 63 } else { 31 });
-            let src = self.s.m.bin(c, Bin::And, shifted, mask);
+            let mask31 = self.s.m.i32(31);
+            let within_half = self.s.m.bin(c, Bin::And, shifted, mask31);
+            let src = if self.x.native.wave64 {
+                let lane = self.lane_index();
+                let hi_mask = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, lane, hi_mask);
+                self.s.m.bin(c, Bin::Or, base, within_half)
+            } else {
+                within_half
+            };
             let active = guard.unwrap_or_else(|| self.s.m.bool(true));
             let four = self
                 .s
@@ -7402,9 +7411,9 @@ mod tests {
                 code: code.clone(),
             };
             let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
             let mut lowered = lower(&Parts {
                 native: &native,
                 p: &p,
