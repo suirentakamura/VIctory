@@ -135,19 +135,36 @@ pub(crate) fn scratch_layout(
         dst_strides.push(dst_stride);
         total_stride = total_stride.checked_add(u64::from(dst_stride))?;
     }
-    // Each slot after the first may need up to 15 bytes of 16-byte alignment.
-    let align_slack = 16u64.checked_mul((slots.len() - 1) as u64)?;
-    let usable = capacity_bytes.checked_sub(align_slack)?;
-    let raw_verts = usable / total_stride;
-    let vert_capacity = ((raw_verts / 6) * 6).min(u64::from(u32::MAX));
-    if vert_capacity < 6 {
-        return None;
-    }
+    // Without alignment padding at most this many vertices fit; the padding
+    // between slots (under 16 bytes each) then costs at most a few
+    // rectangles, so step down until the padded layout fits.
+    let mut vert_capacity =
+        ((capacity_bytes / total_stride / 6) * 6).min(u64::from(u32::MAX) / 6 * 6);
+    let layouts = loop {
+        if vert_capacity < 6 {
+            return None;
+        }
+        if let Some(layouts) = place(slots, &dst_strides, vert_capacity, capacity_bytes) {
+            break layouts;
+        }
+        vert_capacity -= 6;
+    };
+    Some((vert_capacity as u32, layouts))
+}
+
+/// The slots' regions for `verts` vertices each, 16-byte aligned one after
+/// the other, if they end within `capacity_bytes`.
+fn place(
+    slots: &[(u32, u32)],
+    dst_strides: &[u32],
+    verts: u64,
+    capacity_bytes: u64,
+) -> Option<Vec<SlotLayout>> {
     let mut cursor = 0u64;
     let mut layouts = Vec::with_capacity(slots.len());
-    for (&(slot, _), dst_stride) in slots.iter().zip(dst_strides) {
+    for (&(slot, _), &dst_stride) in slots.iter().zip(dst_strides) {
         let dst_offset = cursor.next_multiple_of(16);
-        let dst_size = vert_capacity.checked_mul(u64::from(dst_stride))?;
+        let dst_size = verts.checked_mul(u64::from(dst_stride))?;
         let end = dst_offset.checked_add(dst_size)?;
         if end > capacity_bytes {
             return None;
@@ -160,7 +177,7 @@ pub(crate) fn scratch_layout(
         });
         cursor = end;
     }
-    Some((vert_capacity as u32, layouts))
+    Some(layouts)
 }
 
 /// The vertex index bound shared across all bound per-vertex slots: a record's
@@ -875,6 +892,17 @@ mod tests {
         assert_eq!(layouts[1].dst_stride, 12);
         assert_eq!(layouts[1].dst_size, cap * 12);
         assert!(layouts[1].dst_offset + u64::from(layouts[1].dst_size) <= 1024);
+
+        // Two slots that fit exactly, with no padding needed between them:
+        // 6 vertices of 8 bytes, then 6 of 12 (48 is 16-byte aligned).
+        let (cap, layouts) = scratch_layout(&[(0, 8), (1, 12)], 120).unwrap();
+        assert_eq!(cap, 6);
+        assert_eq!(layouts[1].dst_offset, 48);
+        // Padding is counted where it is needed: 6 * 4 = 24 bytes, then 16-byte
+        // alignment to 32, then 6 * 4 more; 55 bytes are too few, 56 enough.
+        assert_eq!(scratch_layout(&[(0, 4), (1, 4)], 55), None);
+        let (cap, layouts) = scratch_layout(&[(0, 4), (1, 4)], 56).unwrap();
+        assert_eq!((cap, layouts[1].dst_offset), (6, 32));
     }
 
     #[test]
