@@ -1,7 +1,7 @@
 //! The PC container around emitted DXIL: feature flags (`SFI0`), the
 //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
-//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
-//! the container hash that D3D12 checks.
+//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
+//! plus the container hash that D3D12 checks.
 
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,9 +167,11 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Validator 1.8: runtime info 3 and the entry-point name.
+    pub validator18: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -185,8 +187,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let info_size = if p.validator18 { 52 } else { 48 };
+    u32s(&mut out, &[info_size]);
+    let mut info = [0u8; 52];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -225,7 +228,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(gs.max_vertices as u16).to_le_bytes());
     }
-    out.extend(info);
+    if p.validator18 {
+        // Runtime info 3 names the entry point at offset 1 in the strings.
+        info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    }
+    out.extend(&info[..info_size as usize]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -236,8 +243,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
+    // The optional entry point and arbitrary semantics (system values use ""),
+    // then indices.
+    let mut strings = if p.validator18 {
+        b"\0main\0".to_vec()
+    } else {
+        vec![0]
+    };
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
