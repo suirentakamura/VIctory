@@ -481,7 +481,9 @@ impl Host {
             );
             if !target.runs(64) {
                 tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                    "the host has no 64-lane waves: console wave64 compute programs that need \
+                     their whole wave run as two 32-lane waves where there is a form for \
+                     them; the rest do not translate, and their dispatches are dropped"
                 );
             }
             target
