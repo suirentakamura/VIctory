@@ -4,10 +4,10 @@ Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
 half, divergent branches and loops, LDS shared in the console's
-instruction order, and (in groups of exactly 64 threads) whole-wave integer
-reductions and prefix sums. Still open: groups of several console waves,
-whole-wave sections in other groups or of floats, and `ds_permute`; each
-stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
+instruction order, and (in groups of exactly 64 threads) whole-wave
+reductions and prefix sums, of integers and floats. Still open: groups of
+several console waves, whole-wave sections in other groups, and
+`ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
 and is lowered as an in-half read, like `ds_swizzle`.)
 
 ## The problem
@@ -131,9 +131,13 @@ reach every LDS access together, so a group barrier before each access puts
 it after every earlier one. This also takes the programs that needed 64-lane
 waves only for that (one console wave per group, LDS, no cross-lane read).
 Two testers' counts on the title put those first: 120 of the 223 programs
-#233 still stopped on a 32-lane host. On an RTX 5070 the LDS tests pass
-without the barrier too (that card keeps the two waves in step), so they
-check the result, not the need for the barrier.
+#233 still stopped on a 32-lane host. On an RTX 5070 most LDS tests pass
+without the barrier too (that card keeps the two waves in step, and a
+branch on EXEC is an exchange, which is a barrier itself). One does not:
+with a write under one EXEC mask and a read under another and no branch
+between them, the lower half reads before the upper half writes every
+time unless the barrier is there
+(`lds_written_and_read_in_different_masked_blocks`).
 
 **Whole-wave sections** (contributed by Raxstreams). A section stays
 recognised as it is (`emit::wave`), and only what it leaves crosses the
@@ -141,9 +145,11 @@ halves, where the section is lowered: each half's reduction is exchanged
 and the two are combined with the section's own operation (sum, and, or,
 xor, minimum, maximum of integers); a prefix sum in the upper half adds the
 lower half's total. Only in a group of exactly 64 threads, so both halves
-are whole. Float reductions stop: a float sum would change its order, and
-minimum and maximum, which would stay exact, are not done yet. A title run
-on #439 put these next: 24 of the 45 programs the stack still stopped.
+are whole. Floats cross as their bits: minimum and maximum stay exact, and
+a sum is each half's sum added last, one more order of additions next to
+the console's and the host wave's own (the last bits may differ, as they
+already may in one host wave). A title run on #439 put sections next: 24
+of the 45 programs the stack still stopped.
 
 What still stops says why: `console wave64 lanes in a group of more than 64
 threads`, `ds_permute across the halves`, or `a whole-wave section` (in

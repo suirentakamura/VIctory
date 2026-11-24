@@ -568,11 +568,20 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
 /// in the test above, then a read of lane 63: the reduction over the whole
 /// console wave, left in s10. It uses v1 to v3 as scratch in every lane.
 fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
+    reduction_scan_of(opcode, ident, None)
+}
+
+/// [`reduction_scan`] with the identity as a literal when `literal` gives
+/// one (`ident` is then the literal operand, 0xFF).
+fn reduction_scan_of(opcode: u32, ident: u32, literal: Option<u32>) -> Vec<u32> {
     let op = opcode << 25;
-    vec![
+    let mut words = vec![
         0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
         0xD501_0001,
         0x0002_0000 | ident, // v_cndmask_b32 v1, ident, v0, s[0:1]
+    ];
+    words.extend(literal);
+    words.extend([
         op | 0x0002_02FA,
         0xFF01_1101, // v_<op> v1, v1, v1 row_shr:1
         op | 0x0002_02FA,
@@ -584,6 +593,9 @@ fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
         0xD778_0002,
         0x0305_8301,         // v_permlanex16_b32 v2, v1, -1, -1
         0x7E06_0200 | ident, // v_mov_b32 v3, ident
+    ]);
+    words.extend(literal);
+    words.extend([
         0x7E06_02FA,
         0xAF00_E402,      // v_mov_b32 v3, v2 row_mask:0xa
         op | 0x0002_0701, // v_<op> v1, v1, v3
@@ -595,7 +607,8 @@ fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
         0xD760_000A,
         0x0001_7F01, // v_readlane_b32 s10, v1, 63
         0xBEFE_0400, // s_mov_b64 exec, s[0:1]
-    ]
+    ]);
+    words
 }
 
 /// Reductions over the whole console wave need both halves: the sum of the
@@ -843,5 +856,83 @@ fn backward_permute_in_other_masks_groups_and_forms() {
     ];
     console_flow_case("backward permute beside a lane read", &with_read, 64, |t| {
         next(t) + 40
+    });
+}
+
+/// Float reductions over the whole console wave: the lane ids as floats,
+/// their sum, their maximum (lane 63, in the upper half) and their minimum
+/// (lane 0, in the lower half), with the identities the operations need
+/// (0.0, -inf, +inf). Each half's result crosses as its bits.
+#[test]
+fn float_whole_wave_reductions_join_both_host_waves() {
+    // (operation, VOP2 opcode, identity operand, its literal, the result)
+    for (label, opcode, ident, literal, want) in [
+        ("v_add_f32", 3, 0x80, None, 2016),
+        ("v_max_f32", 16, 0xFF, Some(0xFF80_0000), 63),
+        ("v_min_f32", 15, 0xFF, Some(0x7F80_0000), 0),
+    ] {
+        let mut body = vec![0x7E00_0D00]; // v_cvt_f32_u32 v0, v0
+        body.extend(reduction_scan_of(opcode, ident, literal));
+        body.extend([
+            0x7E00_0F00, // v_cvt_u32_f32 v0, v0
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0x7E04_0F02, // v_cvt_u32_f32 v2, v2
+        ]);
+        console_flow_case(&format!("whole-wave {label}"), &body, 64, |_| want);
+    }
+}
+
+/// A float sum over a mask that straddles the halves (lanes below 40), and
+/// the inclusive float prefix sum of the lane ids, whose upper half starts
+/// from the lower half's total.
+#[test]
+fn masked_and_prefix_float_sums_cross_the_halves() {
+    let mut body = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0x7E00_0D00, // v_cvt_f32_u32 v0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    body.extend(reduction_scan(3, 0x80));
+    body.extend([
+        0x7E0A_020A, // v_mov_b32 v5, s10
+        0x7E0A_0F05, // v_cvt_u32_f32 v5, v5
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x7E00_0F00, // v_cvt_u32_f32 v0, v0
+        0x7E04_0305, // v_mov_b32 v2, v5
+    ]);
+    console_flow_case("masked whole-wave float sum", &body, 64, |t| {
+        if t < 40 { 780 } else { 1 }
+    });
+    let prefix = [
+        0x7E00_0D00, // v_cvt_f32_u32 v0, v0
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32 v1, 0, v0, s[0:1]
+        0x0602_02FA,
+        0xFF01_1101, // v_add_f32 v1, v1, v1 row_shr:1
+        0x0602_02FA,
+        0xFF01_1201, // row_shr:2
+        0x0602_02FA,
+        0xFF01_1401, // row_shr:4
+        0x0602_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E06_02FA,
+        0xAF00_E402, // v_mov_b32 v3, v2 row_mask:0xa
+        0x0602_0701, // v_add_f32 v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01, // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x0602_0209, // v_add_f32 v1, s9, v1
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_0F01, // v_cvt_u32_f32 v2, v1
+        0x7E00_0F00, // v_cvt_u32_f32 v0, v0
+    ];
+    console_flow_case("whole-wave inclusive float sum", &prefix, 64, |n| {
+        n * (n + 1) / 2
     });
 }
