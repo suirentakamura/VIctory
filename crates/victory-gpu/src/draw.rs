@@ -531,6 +531,7 @@ impl State {
                     }
                 } else {
                     once!("a shader reads the runtime stride table without a host view heap");
+                    return false;
                 }
             }
         }
