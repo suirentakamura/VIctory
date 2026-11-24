@@ -1004,3 +1004,62 @@ fn selects_on_masks_held_as_numbers() {
         }
     }
 }
+
+/// A lane read inside a divergent branch in a program that also has a
+/// whole-wave section: the lane read takes the console flow on every host,
+/// and the section is lowered there as it is elsewhere. Lanes below 20
+/// read lane 10; every lane then adds the wave's sum of lane ids.
+#[test]
+fn lane_reads_in_branches_beside_a_whole_wave_section() {
+    let mut body = reduction_scan(37, 0x80); // s10 = 2016
+    body.extend([
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x4A04_040A, // v_add_nc_u32 v2, s10, v2
+    ]);
+    console_flow_case(
+        "a lane read in a branch beside a whole-wave section",
+        &body,
+        64,
+        |t| 2016 + if t < 20 { 10 } else { 1 },
+    );
+}
+
+/// EXEC restored dword by dword from a mask: the structure pass holds such
+/// a mask as a number, and that number is known only as the mask's own
+/// dword. The lowering used to follow that in a circle until the stack
+/// ran out; it stops with a reason now.
+#[test]
+fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
+    let body = [
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0x878C_6A7E, // s_and_b64 s[12:13], exec, vcc
+        0xBEFE_030C, // s_mov_b32 exec_lo, s12
+        0xBEFF_030D, // s_mov_b32 exec_hi, s13
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    ];
+    // In the console flow (a host without 64-lane waves) and per lane.
+    for (lanes_min, lanes_max, why) in [
+        (32, 32, "an opaque lane mask"),
+        (32, 64, "a lane mask holding lanes elsewhere read as data"),
+    ] {
+        let target = super::Target {
+            lanes_min,
+            lanes_max,
+        };
+        let e = emit_for(&program(&body, 64), target)
+            .expect_err("stops")
+            .to_string();
+        assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
+    }
+}
