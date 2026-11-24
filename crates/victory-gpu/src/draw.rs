@@ -347,7 +347,9 @@ impl State {
             );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -406,7 +408,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -507,9 +509,11 @@ impl State {
                     }
                 } else {
                     once!("a shader reads the runtime stride table without a host view heap");
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -534,7 +538,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1009,10 +1015,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,

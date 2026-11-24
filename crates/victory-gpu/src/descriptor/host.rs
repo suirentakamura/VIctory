@@ -618,6 +618,15 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    let remaining = shadow.left(address) / element;
+    buffer.NumElements = if buffer.NumElements == 0 {
+        remaining as u32
+    } else {
+        buffer.NumElements.min(remaining as u32)
+    };
+    if buffer.NumElements == 0 {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -665,6 +674,15 @@ fn buffer_uav(
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
+    let remaining = shadow.left(address) / element;
+    buffer.NumElements = if buffer.NumElements == 0 {
+        remaining as u32
+    } else {
+        buffer.NumElements.min(remaining as u32)
+    };
+    if buffer.NumElements == 0 {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {

@@ -1971,7 +1971,7 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod tests {
+mod batch {
     use super::Batch;
     use std::sync::Arc;
 
