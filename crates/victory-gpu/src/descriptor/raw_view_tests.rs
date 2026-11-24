@@ -115,9 +115,9 @@ fn program() -> HostShader {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = victory_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = victory_shader::io::raise(&p, &native).unwrap();
     let st = victory_shader::structure::structure(&p).unwrap();
+    let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = victory_shader::io::raise(&p, &native).unwrap();
     // An empty container (no signature parts): the tag, a digest, version
     // 1, its size, no parts.
     let mut container = b"DXBC".to_vec();
