@@ -203,6 +203,10 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loops whose back edges are all unconditional, by the IR block of a
+    /// conditional exit that dominates every back edge: the limit is tested
+    /// there (see [`Self::fold_limits`]) instead of adding an exit.
+    folded: HashMap<usize, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -496,6 +500,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            folded: HashMap::new(),
         }
     }
 
@@ -827,6 +832,7 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        self.fold_limits(&order);
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -6371,6 +6377,15 @@ impl<'a> Lower<'a> {
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
+            LaneExit::Jump(t)
+                if self.counters.contains_key(&t)
+                    && self.rpo[t] <= self.rpo[b]
+                    && self.folded.values().any(|&h| h == t) =>
+            {
+                // The limit is tested at the loop's exit (`fold_limits`).
+                let _ = self.count_iteration(t, pred::IULT);
+                Term::Br(self.block[t].expect("reachable"))
+            }
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
@@ -6411,6 +6426,27 @@ impl<'a> Lower<'a> {
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some(&h) = self.folded.get(&b) {
+                    // Leave the loop at the limit through this exit, killed.
+                    let (phi, _) = self.counters[&h];
+                    let limit = self.s.m.i32(super::loop_limit());
+                    let stop = self.s.m.cmp(self.cur, pred::IUGE, phi, limit);
+                    if self.s.pixel {
+                        self.s.op(
+                            self.cur,
+                            "discard",
+                            Attr::NoUnwind,
+                            self.s.t.void,
+                            82,
+                            &[stop],
+                        );
+                    }
+                    if self.in_loop(h, taken) {
+                        let go_on = self.s.m.cmp(self.cur, pred::IULT, phi, limit);
+                        self.s.m.bin(self.cur, Bin::And, cond, go_on)
+                    } else {
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
@@ -6470,6 +6506,98 @@ impl<'a> Lower<'a> {
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// Whether IR block `b` is in the loop headed by `h` (it reaches one of
+    /// the loop's back edges without passing through `h`).
+    fn in_loop(&self, h: usize, b: usize) -> bool {
+        self.loop_body(h).contains(&b)
+    }
+
+    /// The natural loop of header `h`: its back edges' sources and every
+    /// block reaching them without passing through `h`.
+    fn loop_body(&self, h: usize) -> HashSet<usize> {
+        let blocks = &self.x.p.blocks;
+        let mut body = HashSet::from([h]);
+        let mut work: Vec<usize> = blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+            .collect();
+        while let Some(q) = work.pop() {
+            if body.insert(q) {
+                work.extend(
+                    blocks[q]
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|&r| self.block[r].is_some()),
+                );
+            }
+        }
+        body
+    }
+
+    /// A loop whose back edges are all unconditional jumps gets its
+    /// [`LOOP_LIMIT`] test on a conditional exit that dominates every back
+    /// edge, so each iteration passes it. A test on the back edge itself
+    /// would add an exit to a block outside every structured construct, and
+    /// translators that need structured control flow (vkd3d-proton's
+    /// DXIL-to-SPIR-V) then emit a loop the Vulkan driver rejects.
+    fn fold_limits(&mut self, order: &[usize]) {
+        let blocks = &self.x.p.blocks;
+        let idom = crate::ir::idoms(blocks, order, &self.rpo);
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                return true;
+            }
+            if idom[b] == b || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        // Inner loops first (later in reverse postorder), so an exit leaving
+        // several loops tests the innermost one's count.
+        let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+        headers.sort_by_key(|&h| std::cmp::Reverse(self.rpo[h]));
+        for h in headers {
+            let latches: Vec<usize> = blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            if !latches
+                .iter()
+                .all(|&q| matches!(self.x.st.exits[q], LaneExit::Jump(t) if t == h))
+            {
+                continue;
+            }
+            let body = self.loop_body(h);
+            // The innermost such exit: the last in reverse postorder.
+            let exit = body
+                .iter()
+                .copied()
+                .filter(|&e| match self.x.st.exits[e] {
+                    LaneExit::Branch {
+                        taken, not_taken, ..
+                    } => {
+                        taken != h
+                            && not_taken != h
+                            && body.contains(&taken) != body.contains(&not_taken)
+                    }
+                    _ => false,
+                })
+                .filter(|&e| !self.counters.contains_key(&e) || e == h)
+                .filter(|&e| latches.iter().all(|&q| dominates(e, q)))
+                .max_by_key(|&e| self.rpo[e]);
+            if let Some(e) = exit {
+                // One header per exit block: an exit leaving two loops keeps
+                // the outer one's back-edge test.
+                self.folded.entry(e).or_insert(h);
+            }
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
