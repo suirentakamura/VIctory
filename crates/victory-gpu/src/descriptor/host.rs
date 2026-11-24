@@ -365,13 +365,17 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
+        self.release_with(first, n, Self::forget_view);
+    }
+
+    pub(super) fn release_with(&self, first: u32, n: u32, mut clear: impl FnMut(&Self, u32)) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         // Clear the retiring list's aliases before another list can lease
         // these slots and publish its own stride entries.
         for index in first..first.saturating_add(n).min(self.alias_base) {
-            self.forget_view(index);
+            clear(self, index);
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(DYNAMIC) as usize;
@@ -682,7 +686,7 @@ impl HostHeap {
 
     /// Slot `index` holds no view shaders read through the runtime stride
     /// table: its entry is cleared and its raw view given back.
-    fn forget_view(&self, index: u32) {
+    pub(super) fn forget_view(&self, index: u32) {
         if self.strides.is_none() {
             return;
         }

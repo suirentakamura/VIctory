@@ -360,3 +360,26 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     assert_eq!(heap.entry_words(6), entry(12, Some(pool + 3), 0));
     drop(memory);
 }
+
+/// Give the allocator a turn at the start of cleanup for the last leased
+/// slot. This exercises the release ordering without a scheduler race.
+#[test]
+fn retiring_slot_is_unavailable_until_its_alias_is_cleared() {
+    let Some(heap) = HostHeap::new(false, 1) else {
+        eprintln!("Skipping descriptor retirement test: no host view heap");
+        return;
+    };
+    let capacity = heap.alias_base() - heap.count();
+    let first = heap.dynamic(capacity).expect("empty dynamic pool");
+    let last = first + capacity - 1;
+    let mut during_cleanup = None;
+    heap.release_with(last, 1, |heap, index| {
+        assert_eq!(index, last);
+        during_cleanup = Some(heap.dynamic(1));
+        heap.forget_view(index);
+    });
+
+    assert_eq!(during_cleanup, Some(None), "slot reusable before cleanup");
+    assert_eq!(heap.dynamic(1), Some(last), "cleared slot was not returned");
+    eprintln!("Verified descriptor lease during and after alias cleanup");
+}
