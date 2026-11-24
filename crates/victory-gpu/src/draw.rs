@@ -79,6 +79,9 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Root SRVs bound as one-view tables in this list: (host heap, title
+    /// address) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -493,12 +496,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        // An unset table is undefined: a null view instead.
+                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                            return false;
+                        }
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    if tabled {
+                        if !self.root_srv_table(list, Some(address), param, compute) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -511,6 +525,75 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        true
+    }
+
+    /// Binds a root SRV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// title buffer's host copy from `address` to the copy's end, or a null
+    /// view (no address, or no host copy). One slot per address per list.
+    /// False if no dynamic slot could be had (the draw is dropped).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root SRV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, index, 1));
+                self.root_srv_slots.insert(key, index);
+                match &shadow {
+                    Some((a, s)) => {
+                        // SAFETY: a live buffer.
+                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                        let offset = s.gpu(*a) - base;
+                        if offset.is_multiple_of(16) {
+                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        } else {
+                            // Raw views start on 16 bytes; one from the
+                            // aligned start would shift every read.
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                "a root SRV not on 16 bytes reads zeros"
+                            );
+                            host.null_raw_at(index);
+                        }
+                    }
+                    None => host.null_raw_at(index),
+                }
+                index
+            }
+        };
+        if let Some((a, s)) = &shadow {
+            s.refresh(list, *a, s.left(*a).min(1 << 20));
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
