@@ -330,7 +330,8 @@ fn translate(
     for p in programs {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+            Ok(mut program) => {
+                victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 let res = match resource::track(&program, &p.layout, p.stage) {

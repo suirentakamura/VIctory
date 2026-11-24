@@ -136,9 +136,10 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             i += 1;
             continue;
         };
+        // The saved mask may come back from another register: a reload of
+        // it from a VGPR lane forwarded to it (`crate::sgpr_spill`).
         let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+            insts[j].write(Reg::S(EXEC)).is_some() && insts[j].reads.iter().any(|r| r.1 == saved)
         });
         let Some(end) = end else {
             break;
@@ -148,16 +149,6 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         i = end + 1;
     }
     out
-}
-
-fn saved_code(inst: &Inst) -> u8 {
-    match &inst.fields {
-        Fields::Sop {
-            dst: Some(Operand::Scalar { code, .. }),
-            ..
-        } => *code,
-        _ => NULL,
-    }
 }
 
 /// The lane `l` reads with DPP, whether it reads 0 instead, and whether it
@@ -675,5 +666,37 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    fn build(words: &[u32], wave64: bool) -> Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, wave64, 8).unwrap()
+    }
+
+    #[test]
+    fn a_section_restores_exec_from_a_reload_of_the_saved_mask() {
+        // Assembled with llvm-mc (gfx1030, wave32): the saved EXEC spilled
+        // to lane 2 of v5, s0 reused, and EXEC restored from its reload.
+        let mut p = build(
+            &[
+                0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+                0xD761_0005,
+                0x0001_0400, // v_writelane_b32 v5, s0, 2
+                0xD501_0001,
+                0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+                0xBE80_0380, // s_mov_b32 s0, 0
+                0x4A02_02FA,
+                0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+                0xD760_0001,
+                0x0001_0505, // v_readlane_b32 s1, v5, 2
+                0xBEFE_0301, // s_mov_b32 exec_lo, s1
+                0xBF81_0000, // s_endpgm
+            ],
+            false,
+        );
+        assert!(sections(&p, 0).is_empty());
+        crate::sgpr_spill::forward(&mut p);
+        let found = sections(&p, 0);
+        assert_eq!(found[&0].end, 6);
     }
 }

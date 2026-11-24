@@ -14,6 +14,7 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod sgpr_spill;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};
