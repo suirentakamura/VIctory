@@ -14,7 +14,8 @@ tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
-victory-shader.workspace = true
+# The stand-in pixel shader (`emit::host::stub_ps`).
+victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
 tempfile.workspace = true
