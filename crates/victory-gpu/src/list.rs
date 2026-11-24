@@ -133,6 +133,33 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// The dynamic descriptor slots of a title list, if there is a host GPU.
+#[cfg(windows)]
+fn lease(this: This) -> Option<std::sync::Arc<crate::descriptor::lease::Lease>> {
+    host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(state.lease().clone())
+}
+
+/// Before a list is submitted: false if the slots of its tables were taken
+/// back after an earlier submission (a heap ran short, see
+/// [`crate::descriptor::lease`]); it must not run again until it is reset.
+/// Until [`finished`] its slots cannot be taken back.
+#[cfg(windows)]
+pub(crate) fn may_run(this: This) -> bool {
+    lease(this).is_none_or(|lease| lease.start())
+}
+
+/// After a list ran: its slots may be taken back if a heap runs short.
+#[cfg(windows)]
+pub(crate) fn finished(this: This) {
+    if let Some(lease) = lease(this) {
+        lease.finish();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
