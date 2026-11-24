@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its native program runs in 64-lane console waves
+    /// (diagnostics: `VICTORY_SKIP_WAVE64`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    wave64: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +92,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                wave64: OnceLock::new(),
             })
         })
         .clone()
@@ -233,19 +239,66 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The stages `VICTORY_SKIP_WAVE64` names (`mesh`, `compute`, `vertex`,
+/// `pixel`).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skip_stages(value: &str) -> Vec<&'static str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let stage = ["mesh", "compute", "vertex", "pixel"]
+                .into_iter()
+                .find(|&k| k.eq_ignore_ascii_case(s));
+            if stage.is_none() {
+                tracing::warn!(
+                    stage = s,
+                    "VICTORY_SKIP_WAVE64 expects mesh, compute, vertex or pixel"
+                );
+            }
+            stage
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// Whether the container's native program runs in 64-lane console waves.
+    fn wave64(&self) -> bool {
+        *self.wave64.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| p.wave64))
+        })
+    }
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
+    let wave64 = WAVE64.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
+        parse_skip_stages(&value)
+    });
+    if hashes.is_empty() && wave64.is_empty() {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
+        })
         .map(|shader| shader.hash.as_str())
 }
 
@@ -505,6 +558,17 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn skip_stages_names_known_stages_only() {
+        assert_eq!(
+            super::parse_skip_stages(" mesh,Compute ,,"),
+            ["mesh", "compute"]
+        );
+        assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
+        assert!(super::parse_skip_stages("").is_empty());
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
