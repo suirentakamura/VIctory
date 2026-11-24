@@ -36,6 +36,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;
