@@ -76,6 +76,7 @@
 //!   console never exports them).
 
 mod bitcode;
+pub mod clamp;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
