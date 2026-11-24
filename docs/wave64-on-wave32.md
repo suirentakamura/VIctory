@@ -1,6 +1,7 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: plan. Steps 1 and 2 are in.
+Status: steps 1, 2 and 4 are in. Programs whose lanes read only their own
+half run on NVIDIA; the rest still need 64-lane waves.
 
 ## The problem
 
@@ -30,16 +31,34 @@ same thread group. The shader declares `WaveSize(32)`; console lane
 = console thread % 64, half = bit 5 of it.
 
 **Lane assignment.** The relabelling in `Lower::thread_id` assumes each
-host wave holds a wave-aligned run of flat thread ids. That holds for 1-D
-groups on the hosts seen so far, but not for all 3-D groups on NVIDIA. The
-split form takes console threads from a groupshared counter instead: one
-lane of each host wave adds 32 to it when the wave starts and shares the
-result, and the wave's lanes take the next 32 console threads in lane order.
+host wave holds a wave-aligned run of flat thread ids: it takes the first
+lane's flat id, rounded down to the declared wave size, plus the host lane.
+XCL's notes report NVIDIA forming waves from non-consecutive thread indices
+in some 3-D groups. On an RTX 5070 with this relabelling, every group
+`emit::split_tests` tries is exact: 32, 64 and 128 threads in 1-D, and
+4x4x4, 8x8x2, 2x4x8, 16x2x4, 8x8x4 and 4x8x8. If another driver breaks it,
+the fallback is to take console threads from a groupshared counter: one lane
+of each host wave adds 32 to it when the wave starts and shares the result,
+and the wave's lanes take the next 32 console threads in lane order.
 
 **What stays inside a half** needs nothing: DPP16 and DPP8 (rows of 16,
-groups of 8), `v_permlane16`, `v_permlanex16` (the two rows of a 32-lane
-half), `ds_swizzle` (groups of 32 or 4). The lowering must compute their
-source lanes from the host lane (0..31), not from `wave() - 1` masks.
+groups of 8), `ds_swizzle` (groups of 32 or 4), and `v_permlane16` /
+`v_permlanex16` (the two rows of a 32-lane half; not lowered at all yet).
+Their lowering computes the source lane from the host lane's place in its
+row or group, so it is unchanged in the split form.
+
+Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
+the host has no 64-lane waves and the program:
+- reads other lanes only through DPP and `ds_swizzle`;
+- reads no mask whole and tests no bit of a mask held as a number;
+- has no whole-wave sections (their reductions would cover a half);
+- uses no LDS (the console compiler may have left out barriers between
+  lanes of one wave).
+
+Anything else still stops with the step 1 reason. `mask_dword`, the wave
+reduction lowering and `lane_bit` refuse the split form as a safety net.
+`v_readfirstlane` reads the first active lane of the host wave, as it
+already did for every wave64 program without a declared wave size.
 
 **What crosses halves** goes through an exchange in groupshared memory:
 
@@ -104,9 +123,10 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
 2. ~~Adapter selection for tests and tools.~~
 3. Measure the title's programs by reason (`--host-lanes 32-32`), to
    order steps 4 to 6.
-4. In-half programs: console-lane programs whose cross-lane operations all
-   stay inside a half, with no mask read whole. They need the lane
-   assignment and nothing else.
+4. ~~In-half programs: console-lane programs whose cross-lane operations
+   all stay inside a half, with no mask read whole.~~ No new lane assignment
+   was needed (see above). A later widening is LDS in multi-wave groups,
+   whose waves already meet at barriers.
 5. Uniform regions and the one-wave exchange (ballots, readlane, mbcnt).
 6. Multi-wave groups (counters), then one-wave LDS sharing.
 
