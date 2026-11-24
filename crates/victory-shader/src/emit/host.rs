@@ -221,7 +221,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u16, bool)> = stages
             .iter()
             .flat_map(|(s, _)| {
                 let cbvs = s.root_cbvs.iter().map(|&r| (r, false));

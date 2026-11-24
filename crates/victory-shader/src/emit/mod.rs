@@ -30,7 +30,9 @@
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//!   address the title sets is the buffer's. An address the title passes
+//!   in two root constants is a root view too, at a register that names
+//!   those constants ([`RootView`]).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -161,15 +163,41 @@ pub struct HostShader {
     /// The same samplers decoded, `s<n>` at position n: the static sampler
     /// descriptions the host's root signature declares.
     pub static_samplers: Vec<StaticSampler>,
-    /// Root CBVs the shader reads: root parameter indices, each bound as
-    /// `b<index>` in [`ROOT_CBV_SPACE`].
-    pub root_cbvs: Vec<u8>,
-    /// Root SRVs (raw buffers) the shader reads: `t<index>` in
+    /// Root CBVs the shader reads, each bound as `b<register>` in
+    /// [`ROOT_CBV_SPACE`] (see [`RootView`] for the register).
+    pub root_cbvs: Vec<u16>,
+    /// Root SRVs (raw buffers) the shader reads: `t<register>` in
     /// [`ROOT_CBV_SPACE`].
-    pub root_srvs: Vec<u8>,
+    pub root_srvs: Vec<u16>,
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+}
+
+/// Where the address of a root view comes from, and the register it is
+/// bound at: the title's root parameter index for a root descriptor;
+/// `(dword + 1) << 8 | slot` for an address in two root constants, low
+/// half at `dword` (#614).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootView {
+    /// Root parameter index in the title's root signature.
+    pub slot: u8,
+    /// The root constant holding the address's low half (the high half is
+    /// the next one); none for a root descriptor. Below 255.
+    pub dword: Option<u8>,
+}
+
+impl RootView {
+    pub fn register(self) -> u16 {
+        u16::from(self.dword.map_or(0, |d| d + 1)) << 8 | u16::from(self.slot)
+    }
+
+    pub fn of(register: u16) -> RootView {
+        RootView {
+            slot: register as u8,
+            dword: (register >> 8).checked_sub(1).map(|d| d as u8),
+        }
+    }
 }
 
 impl HostShader {
@@ -1541,6 +1569,9 @@ mod barycentric_tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         assert!(l.stride_table);

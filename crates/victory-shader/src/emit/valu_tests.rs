@@ -1049,6 +1049,9 @@ fn run_wave_cs(wave64: bool, body: &[u32], mut check: impl FnMut(&str, &[u32])) 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
 
@@ -1060,6 +1063,7 @@ fn run_wave_cs(wave64: bool, body: &[u32], mut check: impl FnMut(&str, &[u32])) 
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

@@ -322,9 +322,11 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
-    /// Root parameters of its root views: (title root parameter, ours).
-    pub(crate) root_cbvs: Vec<(u8, u32)>,
-    pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Root parameters of its root views: (register, ours). The register
+    /// names where the title sets the address
+    /// ([`victory_shader::emit::RootView`]).
+    pub(crate) root_cbvs: Vec<(u16, u32)>,
+    pub(crate) root_srvs: Vec<(u16, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
 }

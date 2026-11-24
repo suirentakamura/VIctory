@@ -9,8 +9,9 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
-/// `t<root parameter index>` and `u<root parameter index>` in this space.
+/// Where root CBVs, SRVs and UAVs are bound: `b<register>`, `t<register>`
+/// and `u<root parameter index>` in this space, a CBV's or SRV's register a
+/// [`super::RootView`]'s.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one [`StrideEntry`] per view-heap slot).
@@ -140,10 +141,10 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
-    /// Root CBVs read, by root parameter index, with their handles.
-    pub root_cbvs: Vec<(u8, V)>,
+    /// Root CBVs read, by register ([`super::RootView`]), with their handles.
+    pub root_cbvs: Vec<(u16, V)>,
     /// Root SRVs (raw buffers) read, likewise.
-    pub root_srvs: Vec<(u8, V)>,
+    pub root_srvs: Vec<(u16, V)>,
     /// Root UAVs (raw buffers) read and written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
@@ -294,9 +295,9 @@ impl Shader {
         self.annotate(block, h, 13, u32::MAX)
     }
 
-    /// The handle of the root CBV of root parameter `slot`, made in the
-    /// entry block.
-    pub fn root_cbv_handle(&mut self, slot: u8) -> V {
+    /// The handle of the root CBV at register `slot`, made in the entry
+    /// block.
+    pub fn root_cbv_handle(&mut self, slot: u16) -> V {
         if let Some(&(_, h)) = self.root_cbvs.iter().find(|r| r.0 == slot) {
             return h;
         }
@@ -318,8 +319,8 @@ impl Shader {
         h
     }
 
-    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
-    pub fn root_srv_handle(&mut self, slot: u8) -> V {
+    /// The handle of the root SRV (a raw buffer) at register `slot`.
+    pub fn root_srv_handle(&mut self, slot: u16) -> V {
         if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
             return h;
         }

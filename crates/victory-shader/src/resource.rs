@@ -27,6 +27,9 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// The parameter's dword holding the address's low half: 0 but for
+    /// root constants, which may carry an address in two of their dwords.
+    pub dword: u32,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
@@ -627,7 +630,19 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+        let mut s = self.sum(lo);
+        // A root constant past a parameter's first dword is a computed term
+        // to `sum`; with no other base, it is an address's low half.
+        if s.base.is_none()
+            && let Some(v) = s.dynamic
+            && let Some(reg) = self.inputs[v.0 as usize]
+            && self
+                .param_of(reg)
+                .is_some_and(|(p, _)| self.layout[p].root == RootType::Constants)
+        {
+            s.base = Some(v);
+            s.dynamic = None;
+        }
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
@@ -640,6 +655,7 @@ impl<'a> Tracer<'a> {
             }
             return Ok(Address {
                 param: CODE,
+                dword: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -647,17 +663,28 @@ impl<'a> Tracer<'a> {
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
+        let (param, dword) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;
+        let input = |reg| self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
+                Some(input(high).ok_or("a root descriptor without its high half")?)
+            }
+            // An address the title passes as two root constants: its high
+            // half is the next dword of the same parameter.
+            RootType::Constants if dword + 1 < self.layout[param].sgprs => {
+                let Reg::S(low) = reg else { unreachable!() };
+                Some(input(Reg::S(low + 1)).ok_or("an address with an untracked high half")?)
             }
             _ => return Err("an address from a root parameter that is no address"),
+        };
+        let dword = if self.layout[param].root == RootType::Constants {
+            dword
+        } else {
+            0
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
@@ -669,6 +696,7 @@ impl<'a> Tracer<'a> {
         }
         Ok(Address {
             param,
+            dword,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
         })
@@ -1759,6 +1787,7 @@ pub(crate) mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
             offset,
             dynamic: None,
         }
@@ -1834,6 +1863,53 @@ pub(crate) mod tests {
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0), (0, 1)]
         );
+    }
+
+    /// The builder's descriptor built around s[10:11], dwords 2 and 3 of
+    /// root constants at user data 8 (#614).
+    const BUILT_AROUND_S10: [u32; 9] = [
+        0x8801_FF0B,
+        0x0010_0000, // s_or_b32 s1, s11, 0x100000
+        0xBE80_030A, // s_mov_b32 s0, s10
+        0xBE82_03C1, // s_mov_b32 s2, -1
+        0xBE83_03FF,
+        0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+        0xF430_0000,
+        0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn an_address_in_two_root_constants_is_a_view() {
+        let r = track_words(&BUILT_AROUND_S10, &[param(Constants, 8, 4)], HwStage::Cs);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: Address {
+                    dword: 2,
+                    ..at(0, 0)
+                },
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+    }
+
+    #[test]
+    fn an_address_split_over_two_root_parameters_is_refused() {
+        let code: Vec<u8> = BUILT_AROUND_S10
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Constants, 10, 1), param(Constants, 11, 1)];
+        assert!(matches!(
+            track(&p, &layout, HwStage::Cs, None),
+            Err(ShaderError::Unsupported {
+                what: "an address from a root parameter that is no address",
+                ..
+            })
+        ));
     }
 
     #[test]
