@@ -156,6 +156,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Runtime stride table entries read in a block, by the descriptor's
+    /// load: the raw slot, the stride and the bias.
+    entries: HashMap<(usize, Site, u8), [V; 3]>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -461,6 +464,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            entries: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -3322,19 +3326,28 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Byte offset `index * stride + off` for a structured buffer whose
-    /// stride was not recovered statically, reading `stride` from the host's
-    /// runtime stride table (`t0`, [`super::STRIDE_SPACE`]).
-    fn runtime_stride_offset(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
+    /// The entry of the host's runtime stride table (`t0`,
+    /// [`super::STRIDE_SPACE`]) for the view-heap slot of `src`, read in the
+    /// current block: the slot holding a raw view of the buffer's bytes
+    /// (the slot itself when the table names none), the stride and the bias
+    /// ([`super::StrideEntry`]).
+    fn stride_entry(&mut self, src: &Source) -> Result<[V; 3], Why> {
+        let key = match src {
+            Source::Loaded { load, first } => Some((self.cur, *load, *first)),
+            _ => None,
+        };
+        if let Some(e) = key.and_then(|k| self.entries.get(&k)) {
+            return Ok(*e);
+        }
         let slot = self
             .heap_slot(src, false)
             .map_err(|_| "a structured buffer of unknown stride")?;
         let c = self.cur;
         let table = self.s.stride_table_handle();
-        let four = self.s.m.i32(4);
-        let addr = self.s.m.bin(c, Bin::Mul, slot, four);
+        let bytes = self.s.m.i32(super::StrideEntry::BYTES);
+        let addr = self.s.m.bin(c, Bin::Mul, slot, bytes);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
+        let mask = self.s.m.i8(3);
         let align = self.s.m.i32(4);
         let res = self.s.op(
             c,
@@ -3344,10 +3357,50 @@ impl<'a> Lower<'a> {
             139,
             &[table, addr, iu, mask, align],
         );
-        let stride_f = self.s.m.extract(c, res, 0);
-        let stride = self.as_int(stride_f);
-        let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
-        Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
+        let stride = self.s.m.extract(c, res, 0);
+        let stride = self.as_int(stride);
+        let word = self.s.m.extract(c, res, 1);
+        let word = self.as_int(word);
+        // The raw slot plus one under the bias; 0: the slot itself.
+        let low = self.s.m.i32(super::StrideEntry::RAW_SLOTS);
+        let named = self.s.m.bin(c, Bin::And, word, low);
+        let zero = self.s.m.i32(0);
+        let own = self.s.m.cmp(c, pred::EQ, named, zero);
+        let one = self.s.m.i32(1);
+        let named = self.s.m.bin(c, Bin::Sub, named, one);
+        let raw = self.s.m.select(c, own, slot, named);
+        let k = self.s.m.i32(28);
+        let bias = self.s.m.bin(c, Bin::LShr, word, k);
+        let e = [raw, stride, bias];
+        if let Some(k) = key {
+            self.entries.insert(k, e);
+        }
+        Ok(e)
+    }
+
+    /// The raw handle (`props`: 11, with the UAV bit for one written) and
+    /// the byte offset of `off` in element `index` of a buffer whose stride
+    /// was not recovered statically. Both come from the host's runtime
+    /// stride table: the handle is of the slot the table names, which holds
+    /// a raw view of the buffer's bytes whatever view the title made (raw,
+    /// structured or typed), and the byte is `index * stride + off` past
+    /// that view's bias.
+    /// shortcut: the console reads zeros (and drops writes) where `off` and
+    /// the access pass the element's end; here they reach the next element,
+    /// as the statically known strides' structured accesses may.
+    fn runtime_view(
+        &mut self,
+        src: &Source,
+        index: V,
+        off: V,
+        props: u32,
+    ) -> Result<(V, V), Why> {
+        let [raw, stride, bias] = self.stride_entry(src)?;
+        let c = self.cur;
+        let element = self.s.m.bin(c, Bin::Mul, index, stride);
+        let byte = self.s.m.bin(c, Bin::Add, element, off);
+        let byte = self.s.m.bin(c, Bin::Add, byte, bias);
+        Ok((self.s.heap_handle(c, raw, false, (props, 0)), byte))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -5970,8 +6023,8 @@ impl<'a> Lower<'a> {
                             [index, off, iu],
                         )
                     } else {
-                        let byte = self.runtime_stride_offset(src, index, off)?;
-                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                        (h, [byte, iu, iu])
                     }
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
@@ -6055,8 +6108,8 @@ impl<'a> Lower<'a> {
                             args.push(self.handle(site, src, false, (12 | u, stride))?);
                             args.extend([index, off]);
                         } else {
-                            let byte = self.runtime_stride_offset(src, index, off)?;
-                            args.push(self.handle(site, src, false, (11 | u, 0))?);
+                            let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                            args.push(h);
                             args.extend([byte, iu]);
                         }
                     }
@@ -6126,8 +6179,7 @@ impl<'a> Lower<'a> {
                             &[h, index, off, mask, align],
                         )
                     } else {
-                        let byte = self.runtime_stride_offset(src, index, off)?;
-                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
                         self.s.op(
                             c,
                             "rawBufferLoad.f32",

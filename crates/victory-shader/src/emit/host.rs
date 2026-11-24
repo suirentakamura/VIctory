@@ -938,6 +938,12 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A buffer UAV of this many dwords, zeroed, viewed as the stride says.
+    BufferUav(u32, Stride),
+    /// A raw view of the whole buffer the view at this (earlier) heap index
+    /// is made on, an SRV or a UAV as that view is: what the GPU side makes
+    /// for the runtime stride table. Not among the UAVs read back.
+    RawAlias(usize),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1095,9 +1101,12 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Buffer views by heap index: (buffer, dwords, unordered).
+            let mut buffers: Vec<Option<(ID3D12Resource, u32, bool)>> = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
+                buffers.push(None);
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {
@@ -1166,17 +1175,31 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
-                        // (dwords, format, elements, flags)
-                        let (n, format, elements, flags) = match *v {
+                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) => {
+                        // (dwords, format, elements, element bytes, flags)
+                        let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 e,
+                                0,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::RawUav(n) => {
-                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            View::RawUav(n) | View::BufferUav(n, Stride::Raw) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::BufferUav(n, Stride::Typed) => (
+                                n,
+                                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                n / 4,
+                                0,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::BufferUav(n, Stride::Structured(s)) => {
+                                (n, DXGI_FORMAT_UNKNOWN, n * 4 / s, s, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
+                            View::BufferUav(n, Stride::Format(f, bytes)) => {
+                                (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
                             _ => unreachable!(),
                         };
@@ -1192,12 +1215,14 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: stride,
                                     Flags: flags,
                                     ..Default::default()
                                 },
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), n, true));
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1293,7 +1318,44 @@ impl Host {
                             },
                         };
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        buffers[i] = Some((b.clone(), data.len() as u32, false));
                         keep.push(b);
+                    }
+                    View::RawAlias(of) => {
+                        let (b, n, unordered) = buffers
+                            .get(of)
+                            .cloned()
+                            .flatten()
+                            .ok_or("a raw alias of no earlier buffer view")?;
+                        if unordered {
+                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_UAV {
+                                        NumElements: n,
+                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        } else {
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: 0,
+                                        NumElements: n,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            dev.CreateShaderResourceView(&b, Some(&desc), at);
+                        }
                     }
                 }
             }
