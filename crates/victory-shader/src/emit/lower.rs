@@ -411,11 +411,12 @@ impl<'a> Lower<'a> {
             // of 8, 32 or 4): the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
                 let n = i.name();
-                n.contains("permute")
+                (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
@@ -478,7 +479,7 @@ impl<'a> Lower<'a> {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
-                } else if insts().any(|i| i.name().contains("permute")) {
+                } else if insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32") {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
                 } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
@@ -504,7 +505,7 @@ impl<'a> Lower<'a> {
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
-                && !insts().any(|i| i.name().contains("permute"))
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
                 console_lanes = true;
@@ -2323,6 +2324,40 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_bpermute_b32" {
+            // RDNA2 gathers separately within each 32-lane half. Disabled
+            // source lanes supply zero and disabled destinations are preserved.
+            self.cross_lane(false)?;
+            let address = self.vgprs(inst, addr.as_ref().ok_or("a backward permute address")?, 1)?[0];
+            let source = self.vgprs(inst, data.first().ok_or("a backward permute source")?, 1)?[0];
+            let offset = self.s.m.i32(u32::from(*offset0));
+            let byte_address = self.s.m.bin(c, Bin::Add, address, offset);
+            let two = self.s.m.i32(2);
+            let word = self.s.m.bin(c, Bin::LShr, byte_address, two);
+            let mask = self.s.m.i32(31);
+            let within_half = self.s.m.bin(c, Bin::And, word, mask);
+            let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+            let high_mask = self.s.m.i32(!31);
+            let base = self.s.m.bin(c, Bin::And, lane, high_mask);
+            let index = self.s.m.bin(c, Bin::Or, base, within_half);
+
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let ty = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, ty, 116, &[active]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let hi = self.s.m.extract(c, ballot, 1);
+            let zero = self.s.m.i32(0);
+            let lower_half = self.s.m.cmp(c, pred::EQ, base, zero);
+            let bits = self.s.m.select(c, lower_half, lo, hi);
+            let shifted = self.s.m.bin(c, Bin::LShr, bits, within_half);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, shifted, one);
+            let enabled = self.s.m.cmp(c, pred::NE, bit, zero);
+            let gathered = self.read_lane(source, index);
+            let value = self.s.m.select(c, enabled, gathered, zero);
+            self.write(inst, Reg::V(dst_reg.ok_or("a backward permute result")?), value, guard);
+            return Ok(());
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.

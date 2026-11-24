@@ -764,3 +764,26 @@ fn lds_written_and_read_in_different_masked_blocks() {
         true,
     );
 }
+
+#[test]
+fn backward_permute_wraps_within_each_half() {
+    let body = [0x3406_0082, 0xDACC_0004, 0x0200_0003];
+    console_flow_case("backward permute", &body, 64, |lane| (lane & !31) | ((lane + 1) & 31));
+}
+
+#[test]
+fn backward_permute_respects_both_exec_masks() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xDACC_0004, 0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:4
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("masked backward permute", &body, 64, |lane| match lane {
+        0..19 => lane + 1,
+        19 => 0,
+        _ => 1,
+    });
+}
