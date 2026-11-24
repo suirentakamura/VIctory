@@ -368,15 +368,15 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        // Clear the retiring list's aliases before another list can lease
+        // these slots and publish its own stride entries.
+        for index in first..first.saturating_add(n).min(self.alias_base) {
+            self.forget_view(index);
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(DYNAMIC) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
-        }
-        drop(guard);
-        // Their raw views go back too: the list that read them is done.
-        for index in first..first.saturating_add(n).min(self.alias_base) {
-            self.forget_view(index);
         }
     }
 
