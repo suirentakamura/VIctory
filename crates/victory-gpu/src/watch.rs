@@ -35,13 +35,43 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges the kernel was asked about since the submission began
+    /// (see [`new_submission`]); under Wine only.
+    asked_now: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    asked_now: Vec::new(),
 });
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    static WINE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    });
+    *WINE
+}
+
+/// A submission begins: memory asked about from now on is asked of the
+/// kernel again. Within one submission, a range the kernel already
+/// answered for is answered from the journal: Wine emulates write watching
+/// page by page under one lock (about 1 ms an asking), and the world's
+/// copies ask about the same big buffers dozens of times per submission
+/// (17 GB checked per frame, 3 s of a frame). A write between two askings
+/// in one submission keeps its dirty bit, so the next submission sees it.
+pub(crate) fn new_submission() {
+    if on_wine() {
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked_now.clear();
+    }
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -54,6 +84,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if on_wine() && j.asked_now.iter().any(|&(f, l)| f <= first && last <= l) {
+        j.asked += 1;
+        return Some((
+            j.asked,
+            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -77,6 +114,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         guard(first * PAGE, last * PAGE)?
     } else {
+        if on_wine() && j.asked_now.len() < 4096 {
+            j.asked_now.push((first, last));
+        }
         Vec::new()
     };
     #[cfg(feature = "diagnostics")]
@@ -307,6 +347,8 @@ mod tests {
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        // Under Wine a range is asked of the kernel once per submission.
+        new_submission();
         let (now, after) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
@@ -324,6 +366,32 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Under Wine, a write after a range was asked about in a submission
+    /// is reported in the next one, not lost.
+    #[test]
+    fn writes_within_a_submission_show_in_the_next() {
+        if !on_wine() {
+            return;
+        }
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        // Kept, not freed: another test given this address would see the
+        // journal's entries for it. The journal may already hold some (a
+        // freed allocation of another test here), so compare with them.
+        new_submission();
+        let (_, before) = writes(p, p + 2 * PAGE, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        let (_, same) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(same, before, "answered from the journal within the submission");
+        new_submission();
+        let (now, next) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert!(next.contains(&(p / PAGE, now)), "the write shows in the next submission");
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
