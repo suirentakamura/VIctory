@@ -1,6 +1,6 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: plan. Step 1 (translating for the host's wave sizes) is in.
+Status: plan. Steps 1 and 2 are in.
 
 ## The problem
 
@@ -92,13 +92,16 @@ assume. These tests are hand-assembled GFX10 programs instead (as in
   the integrated GPU of Ryzen 7000 desktop CPUs), as the reference;
 - in the split form on a 32-lane adapter (NVIDIA),
 
-then compared buffer for buffer. This needs adapter selection in
-`emit::host::Host`.
+then compared buffer for buffer. `emit::host::Host::on(name)` and
+`VICTORY_ADAPTER=<part of the adapter's name>` pick the adapter;
+`emit::tests::each_adapter_gets_what_it_runs` checks every adapter in the
+machine (on a Ryzen 7800X3D with an RTX 5070: the Radeon reports 32-64 and
+takes `WaveSize(64)`, the NVIDIA reports 32-32).
 
 ## Steps
 
 1. ~~Translate for the host's wave range; cache by it; `--host-lanes`.~~
-2. Adapter selection for tests and tools.
+2. ~~Adapter selection for tests and tools.~~
 3. Measure the title's programs by reason (`--host-lanes 32-32`), to
    order steps 4 to 6.
 4. In-half programs: console-lane programs whose cross-lane operations all

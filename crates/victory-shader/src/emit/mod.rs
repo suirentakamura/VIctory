@@ -887,6 +887,36 @@ mod tests {
         }
     }
 
+    /// On every hardware adapter: a wave64 program that reads other lanes
+    /// translates for the adapter exactly when it runs 64-lane waves, and
+    /// the adapter then takes it. On a machine with an AMD and an NVIDIA
+    /// GPU this checks both answers.
+    #[test]
+    #[cfg(windows)]
+    fn each_adapter_gets_what_it_runs() {
+        let Ok(names) = super::host::adapters() else {
+            eprintln!("no DXGI; skipped");
+            return;
+        };
+        let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        for name in names {
+            let Ok(host) = super::host::Host::on(&name) else {
+                eprintln!("{name}: no SM 6.6 device; skipped");
+                continue;
+            };
+            let target = host.target();
+            eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
+            match emit_for(&compute(&words, true), target) {
+                Ok(cs) => {
+                    assert!(target.runs(64), "{name}");
+                    host.compute_pipeline(&cs)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                Err(_) => assert!(!target.runs(64), "{name}"),
+            }
+        }
+    }
+
     #[test]
     fn programs_reading_no_other_lanes_translate_for_any_wave_size() {
         let words = [
