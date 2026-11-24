@@ -42,6 +42,8 @@ mod primitive;
 mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

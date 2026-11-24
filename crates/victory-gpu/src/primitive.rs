@@ -3,7 +3,8 @@
 //! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! made from the other three on the CPU for direct draws and on the GPU for
+//! indirect draws ([`crate::rectangles`]).
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -43,8 +44,8 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     }
 }
 
-#[derive(Clone, Copy)]
-enum Kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
     F32,
     F16,
     Unorm8,
@@ -52,7 +53,7 @@ enum Kind {
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-fn components(format: u32) -> Option<(usize, Kind)> {
+pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -69,11 +70,21 @@ fn components(format: u32) -> Option<(usize, Kind)> {
 }
 
 impl Kind {
-    fn bytes(self) -> usize {
+    pub(crate) fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
             Kind::F16 | Kind::Unorm16 => 2,
             Kind::Unorm8 => 1,
+        }
+    }
+
+    /// Numeric code shared with [`crate::rectangles`]'s HLSL shader.
+    pub(crate) fn code(self) -> u32 {
+        match self {
+            Kind::F32 => 0,
+            Kind::F16 => 1,
+            Kind::Unorm16 => 2,
+            Kind::Unorm8 => 3,
         }
     }
 
@@ -141,10 +152,12 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest, halfway cases to even (the retained bit decides);
+    // a carry out of the mantissa is added into the exponent (`2 - 2^-12`
+    // is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let retained = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + retained) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -196,6 +209,16 @@ mod tests {
         let mut dst = vec![0u8; 6 * 2];
         expand_rects(&src, &mut dst, 2, &[(0, 54)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
+    }
+
+    /// Halfway between two halves, the even one: 1 + 2^-11 lies between
+    /// 0x3c00 and 0x3c01, 1 + 3 * 2^-11 between 0x3c01 and 0x3c02.
+    #[test]
+    fn half_midpoints_round_to_even() {
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        // Just past a midpoint still rounds up.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
     }
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte

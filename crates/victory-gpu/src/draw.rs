@@ -39,9 +39,9 @@ enum Root {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) stride: u32,
 }
 
 #[repr(C)]
@@ -1294,6 +1294,76 @@ impl State {
             },
             None => None,
         };
+        if kind == INDEXED && self.topology == RECTANGLES {
+            once!("indirect indexed rectangles not drawn");
+            why("indexed rectangles not supported");
+            return false;
+        }
+        if kind == DRAW && self.topology == RECTANGLES {
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                return false;
+            };
+            if p.compute || p.mesh {
+                why(&format!(
+                    "pipeline mismatch (compute {}, mesh {}, topology {})",
+                    p.compute, p.mesh, self.topology
+                ));
+                return false;
+            }
+            let Some(signature) = host_signature(DRAW, 16) else {
+                why("no host signature");
+                return false;
+            };
+            if max == 0 {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            let prepared = match crate::rectangles::expand(
+                list,
+                p,
+                &self.vertex,
+                (&args, arguments, stride, max),
+                counter.as_ref().map(|(s, at)| (s, *at)),
+            ) {
+                Ok(p) => p,
+                Err(reason) => {
+                    why(reason);
+                    return false;
+                }
+            };
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            if !self.prepare(list, false) {
+                why("prepare failed for indirect rectangles");
+                return false;
+            }
+            prepared.before_draw(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect rect draw max {max} at {arguments:#x}"),
+                    false,
+                )
+            });
+            // SAFETY: an open list with everything set; `prepared.args_buf` is
+            // list-owned (records past the title's count are empty draws, so
+            // no count buffer), the signature cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &prepared.args_buf,
+                    0,
+                    None::<&ID3D12Resource>,
+                    0,
+                )
+            };
+            prepared.after_draw(list);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1313,7 +1383,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
