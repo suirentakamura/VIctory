@@ -52,8 +52,8 @@ pub fn argument_clamp() -> Vec<u8> {
     let kind = s.m.extract(entry, row, 0);
     let stride = s.m.extract(entry, row, 1);
     let records = s.m.extract(entry, row, 2);
-    let args = s.root_uav_handle(ARGUMENTS);
-    let budget = s.root_uav_handle(BUDGET);
+    let args = s.root_uav_handle(u16::from(ARGUMENTS));
+    let budget = s.root_uav_handle(u16::from(BUDGET));
     let id = s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero]);
 
     let [body, draw, other, dispatch, mesh, join, empty, exit] =

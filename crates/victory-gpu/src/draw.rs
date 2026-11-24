@@ -156,6 +156,10 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// The most of a root UAV's host copy one draw or dispatch compares for
+/// write-back (see [`State::root_uav`]).
+const ROOT_UAV_SPAN: u64 = 4 << 20;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -572,6 +576,11 @@ impl State {
                     }
                 }
             }
+            for &(register, param) in &stage.root_uavs {
+                if !self.root_uav(list, register, param, compute) {
+                    return false;
+                }
+            }
             if let Some(param) = stage.stride_table {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
@@ -590,6 +599,41 @@ impl State {
                     once!("a shader reads the runtime stride table without a host view heap");
                     return false;
                 }
+            }
+        }
+        true
+    }
+
+    /// Binds the root UAV at `register` (a raw buffer the shader reads and
+    /// writes) to the host copy of the title memory it names: brought up to
+    /// date before the list runs, and what the shader writes is copied back
+    /// after. False when the title set no address or no host copy holds it
+    /// (the draw or dispatch is dropped, as before root UAVs were bound).
+    fn root_uav(&self, list: &HostList, register: u16, param: u32, compute: bool) -> bool {
+        let Some(address) = self.view_address(compute, register) else {
+            once!(register, "a shader writes a root UAV the title did not set: dropped");
+            return false;
+        };
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            once!(
+                address = format_args!("{address:#x}"),
+                "a root UAV outside every host copy of title memory: dropped"
+            );
+            return false;
+        };
+        // What the write-back compares: the rest of the copy, at most
+        // ROOT_UAV_SPAN. Writes past it still land in the copy, where later
+        // GPU readers see them; only title CPU reads would miss them.
+        let len = shadow.left(address).min(ROOT_UAV_SPAN);
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        let gpu = shadow.gpu(address);
+        // SAFETY: an open list; the address is in a live host buffer.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootUnorderedAccessView(param, gpu);
+            } else {
+                list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
             }
         }
         true
@@ -726,7 +770,7 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(register, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(register, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(address) = self.view_address(compute, register) {
                     let host =
                         crate::shadow::find(address, 1).map(|s| (s.gpu(address), s.left(address)));

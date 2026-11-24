@@ -141,8 +141,9 @@ fn cached(
     (converter.translate)(container)
 }
 
-/// VSH3: root view registers are 16 bits (#614), and the stride table word.
-const MAGIC: &[u8; 4] = b"VSH3";
+/// VSH4: root view registers are 16 bits (#614), the stride table word, and
+/// root UAV registers.
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -217,7 +218,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for registers in [&s.root_cbvs, &s.root_srvs] {
+    for registers in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, registers.len() as u32);
         for r in registers {
             out.extend(r.to_le_bytes());
@@ -286,6 +287,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.registers()?;
     let root_srvs = r.registers()?;
+    let root_uavs = r.registers()?;
     let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -295,6 +297,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
         stride_table,
     })
 }
@@ -323,6 +326,7 @@ mod tests {
             root_cbvs: vec![2],
             // 0x305: an address in root constants 2 and 3 of parameter 5.
             root_srvs: vec![0, 3, 0x305],
+            root_uavs: vec![1, 0x204],
             stride_table: true,
         }
     }

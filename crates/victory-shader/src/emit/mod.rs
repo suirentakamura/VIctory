@@ -169,6 +169,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<register>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u16>,
+    /// Root UAVs (raw buffers) the shader reads and writes: `u<register>`
+    /// in [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u16>,
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
@@ -439,6 +442,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
     })
 }
@@ -873,6 +877,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             stride_table: false,
         };
         let file = |var: &str, stage| {
@@ -884,6 +889,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: false,
             })
         };
@@ -1601,6 +1607,7 @@ mod barycentric_tests {
             static_samplers: Vec::new(),
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
             stride_table: l.stride_table,
         }
     }

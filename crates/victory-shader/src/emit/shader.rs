@@ -146,7 +146,7 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u16, V)>,
     /// Root UAVs (raw buffers) read and written, likewise.
-    pub root_uavs: Vec<(u8, V)>,
+    pub root_uavs: Vec<(u16, V)>,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
@@ -343,8 +343,8 @@ impl Shader {
         h
     }
 
-    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
-    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+    /// The handle of the root UAV (a raw buffer) at register `slot`.
+    pub fn root_uav_handle(&mut self, slot: u16) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
         }

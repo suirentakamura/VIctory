@@ -327,6 +327,8 @@ pub(crate) struct Stage {
     /// ([`victory_shader::emit::RootView`]).
     pub(crate) root_cbvs: Vec<(u16, u32)>,
     pub(crate) root_srvs: Vec<(u16, u32)>,
+    /// Root UAVs (raw buffers the shader writes), as `root_srvs`.
+    pub(crate) root_uavs: Vec<(u16, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
 }
@@ -423,6 +425,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: None,
             };
             let dwords = t.user_data_dwords();
@@ -450,6 +453,11 @@ impl HostPipeline {
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
                 ),
             ] {
                 for &slot in slots {

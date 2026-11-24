@@ -187,6 +187,7 @@ fn build_cs(body: &[u32], lds_blocks: u32) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         stride_table: lowered.stride_table,
     };
 
@@ -1063,6 +1064,7 @@ fn run_wave_cs(wave64: bool, body: &[u32], mut check: impl FnMut(&str, &[u32])) 
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         stride_table: lowered.stride_table,
     };
 
@@ -1423,3 +1425,4 @@ fn s_lshl_add_sets_scc_on_unsigned_overflow() {
         ],
     );
 }
+

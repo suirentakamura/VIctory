@@ -49,6 +49,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u16>,
     pub root_srvs: Vec<u16>,
+    pub root_uavs: Vec<u16>,
     pub stride_table: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -339,6 +340,9 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// The resource kind of a raw buffer (11) read through unordered access
+/// (`0x1000`), as `handle` gets it.
+const RAW_UAV: u32 = 11 | 0x1000;
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -1221,6 +1225,7 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -1229,6 +1234,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             stride_table,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
@@ -4152,6 +4158,11 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(u16::from(rp.slot)))
                     }
+                    // A root UAV the program reads and writes as a raw
+                    // buffer (the BVH builder's compute programs).
+                    (RootType::Descriptor, Some(ResourceType::Uav), RAW_UAV) => {
+                        Ok(self.s.root_uav_handle(u16::from(rp.slot)))
+                    }
                     // An address in two root constants: what the program does
                     // with it says which view it is.
                     (RootType::Constants, _, 13) => {
@@ -4161,6 +4172,10 @@ impl<'a> Lower<'a> {
                     (RootType::Constants, _, 11) => {
                         let r = view(address.dword).ok_or("an address past the root constants")?;
                         Ok(self.s.root_srv_handle(r))
+                    }
+                    (RootType::Constants, _, RAW_UAV) => {
+                        let r = view(address.dword).ok_or("an address past the root constants")?;
+                        Ok(self.s.root_uav_handle(r))
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
@@ -8815,6 +8830,7 @@ mod tests {
                     static_samplers: Vec::new(),
                     root_cbvs: l.root_cbvs,
                     root_srvs: l.root_srvs,
+                    root_uavs: l.root_uavs,
                     stride_table: l.stride_table,
                 };
                 host.compute_pipeline(&cs).unwrap();

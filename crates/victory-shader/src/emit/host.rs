@@ -221,22 +221,20 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u16, bool)> = stages
+        let mut views: Vec<(u16, D3D12_ROOT_PARAMETER_TYPE)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_CBV));
+                let srvs = s.root_srvs.iter().map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_SRV));
+                let uavs = s.root_uavs.iter().map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_UAV));
+                cbvs.chain(srvs).chain(uavs)
             })
             .collect();
-        views.sort_unstable();
+        views.sort_unstable_by_key(|&(r, k)| (r, k.0));
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                },
+                ParameterType: kind,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
@@ -640,6 +638,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
         stride_table: false,
     }
 }
