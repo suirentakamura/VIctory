@@ -1677,6 +1677,8 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
+                Step::Refresh(shadow, ..) if shadow.in_place() => continue,
+                Step::GpuWrite(shadow, ..) if shadow.in_place() => continue,
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2276,6 +2278,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        crate::uma::drain();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;

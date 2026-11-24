@@ -31,6 +31,35 @@ Nothing here needs game data in the repository; supply your own files as usual.
 - **Rectangle lists.** CPU expansion, GPU expansion for indirect draws (#346)
   and a geometry stage for rectangles placed by vertex number (#1020).
 
+## Unified memory experiment (`VICTORY_UMA`, off by default)
+
+The world's frames take 1-2 s, most of it spent keeping host copies of title
+memory current. `crates/victory-gpu/src/uma.rs` tries the console's model
+instead (also what XCL's design describes): title memory opened as a host
+heap (`OpenExistingHeapFromAddress1`) with a buffer placed over it, so the
+GPU uses the title's bytes in place. Measured on Wine + vkd3d-proton 3.2 +
+RADV (RX 9060 XT):
+
+- Private committed memory opens (up to 4095 MiB, under 1 ms per 256 MiB),
+  coherent both ways, read by the card at about 28 GB/s.
+- Section views (the physical-page pool) do not: vkd3d-proton silently
+  gives an unrelated allocation. Only `MEM_PRIVATE` memory is opened.
+- Freeing memory under an open heap loses the device, so the title's
+  `VirtualFree` of such memory is deferred until the heap is released.
+- Shader writes in place corrupted the title's CPU data (play43), and
+  shader-heavy submissions on system memory hung the card (play44): buffers
+  shaders write always stay copies in card memory.
+- Opening a whole 1-2 GiB run made every write-watch reset in it re-pin the
+  heap at the next submission: 10 s of GPU time per frame (play46). Heaps
+  now cover only the buffer's own pages.
+- With buffers up to 4 MiB in place (`VICTORY_UMA_MAX_KB`), GPU time is as
+  before but frames are no faster (play47): the cost is in big buffers and
+  in buffers shaders write, which must stay copies. A profile shows the
+  submitting thread busy only about a fifth of the time.
+
+`VICTORY_UMA=1` turns it on; `VICTORY_UMA_LOOSE=1` also opens memory outside
+buffer objects.
+
 ## Variables used for this work
 
 | Variable | Effect |

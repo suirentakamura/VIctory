@@ -997,7 +997,7 @@ fn viewed_bytes(view: &View, kept: Option<&ID3D12Resource>) -> Viewed {
     let Some((first, count, element)) = elements else {
         return Viewed::Own;
     };
-    let (Some(kept), Some(shadow)) = (kept, crate::shadow::find(base, len)) else {
+    let (Some(kept), Some(shadow)) = (kept, crate::shadow::find_rw(base, len, unordered)) else {
         return Viewed::Unknown;
     };
     if element == 0 || shadow.buffer.as_raw() != kept.as_raw() {
@@ -1095,7 +1095,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::find_rw(address, len, true)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {

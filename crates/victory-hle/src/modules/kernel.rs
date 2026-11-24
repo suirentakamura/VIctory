@@ -28,6 +28,27 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
+/// Memory the host GPU uses in place cannot be freed under it
+/// (`victory_gpu::uma`): such a free waits for the GPU's last use.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    if victory_gpu::uma::title_free(address as usize, size, kind) {
+        return 1;
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
+}
+
+/// See [`VirtualFree`]: committing pages whose decommit still waits keeps
+/// them (zeroed, as fresh pages are).
+pub extern "system" fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    use windows_sys::Win32::System::Memory::MEM_COMMIT;
+    if !address.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::uma::title_commit(address as usize, size);
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(address, size, kind, protect) }
+}
+
 /// A NUL-terminated string from the title.
 fn narrow(text: *const u8) -> String {
     // SAFETY: the title passes a NUL-terminated string.
@@ -361,8 +382,11 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
+            "api-ms-win-core-memory-*",
         ],
         exports: vec![
+            hle_export!(VirtualFree),
+            hle_export!(VirtualAlloc),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),

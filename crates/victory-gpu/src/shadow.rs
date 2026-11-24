@@ -49,6 +49,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Not a copy: the title's memory itself, opened as a host heap
+    /// ([`crate::uma`]); nothing is uploaded or read back.
+    uma: Option<Arc<crate::uma::Region>>,
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -111,7 +114,28 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            uma: None,
         }
+    }
+
+    /// `[start, start + len)` of title memory inside an opened region.
+    fn in_region(region: Arc<crate::uma::Region>, start: u64, len: u64) -> Shadow {
+        Shadow {
+            buffer: region.buffer().clone(),
+            gpu: region.gpu + (start - region.start as u64),
+            start,
+            len,
+            copied: Mutex::new(Vec::new()),
+            watched: AtomicU8::new(NOT_WATCHED),
+            pending: Mutex::default(),
+            uma: Some(region),
+        }
+    }
+
+    /// Whether this is title memory used in place: refreshes and shader
+    /// writes need no copies (the list still holds it until reset).
+    pub(crate) fn in_place(&self) -> bool {
+        self.uma.is_some()
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -131,6 +155,21 @@ impl Shadow {
     /// [`Shadow::refresh`] that gives the shaders the title's data.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
+        if let Some(region) = &self.uma {
+            // Diagnostics: which ranges shaders write in title memory itself.
+            static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = seen.get_or_insert_with(Default::default);
+            if seen.len() < 4000 && seen.insert((address, len)) {
+                tracing::debug!(
+                    address = format_args!("{address:#x}"),
+                    len,
+                    buffer = format_args!("{:#x}+{:#x}", self.start, self.len),
+                    region = format_args!("{:#x}", region.start),
+                    "unified memory: shaders write in place"
+                );
+            }
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -376,6 +415,10 @@ impl Shadow {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// Shaders write it: it is a copy in card memory, never used in place
+    /// (shader stores and atomics over PCIe stall the card for seconds, and
+    /// a stray store would land in the title's own data).
+    written: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -392,6 +435,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         Entry {
             end: start + len,
             shadow: None,
+            written: false,
         },
     );
 }
@@ -402,8 +446,15 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// len)`, made on first use: title memory itself where it can be
+/// ([`crate::uma`]) and shaders have not written it.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_rw(address, len, false)
+}
+
+/// [`find`] for a binding shaders may write: always a copy in card memory.
+/// A buffer once written stays a copy.
+pub(crate) fn find_rw(address: u64, len: u64, write: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -414,9 +465,25 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return loose(address, end, write);
     };
     let entry = map.get_mut(&key)?;
+    if write && !entry.written {
+        entry.written = true;
+        if entry.shadow.as_ref().is_some_and(|s| s.in_place()) {
+            tracing::debug!(start = format_args!("{:#x}", key.0), "a buffer used in place is written by shaders: copied from now on");
+            entry.shadow = None;
+        }
+    }
+    if entry.shadow.is_none()
+        && !entry.written
+        && entry.end - key.0 <= crate::uma::max_buffer()
+        && let Some(region) = crate::uma::region(key.0, entry.end - key.0)
+    {
+        let len = entry.end - key.0;
+        tracing::debug!(start = format_args!("{:#x}", key.0), len, "buffer used in place");
+        entry.shadow = Some(Arc::new(Shadow::in_region(region, key.0, len)));
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -452,7 +519,21 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, write: bool) -> Option<Arc<Shadow>> {
+    if !write
+        && crate::uma::loose()
+        && let Some(region) = crate::uma::region(address, end - address)
+    {
+        // One for the whole region.
+        let key = (region.start as u64, region.len as u64);
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.get(&key).filter(|s| s.uma.as_ref().is_some_and(|r| Arc::ptr_eq(r, &region))) {
+            return Some(shadow.clone());
+        }
+        let shadow = Arc::new(Shadow::in_region(region, key.0, key.1));
+        map.insert(key, shadow.clone());
+        return Some(shadow);
+    }
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -471,6 +552,22 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(Shadow::new(buffer, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// The title frees memory under `regions`: buffers and loose memory in them
+/// stop using them (a later use opens what is still there afresh, or
+/// copies it); lists that hold them keep them until reset.
+pub(crate) fn forget_regions(regions: &[Arc<crate::uma::Region>]) {
+    let held = |s: &Shadow| s.uma.as_ref().is_some_and(|r| regions.iter().any(|g| Arc::ptr_eq(g, r)));
+    for entry in buffers().values_mut() {
+        if entry.shadow.as_deref().is_some_and(held) {
+            entry.shadow = None;
+        }
+    }
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, s| !held(s));
 }
 
 /// For device-removed reports: the copy of title memory whose host range

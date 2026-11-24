@@ -623,7 +623,7 @@ impl State {
             // would reach whatever the host placed after the buffer.
             return self.root_srv_table(list, Some(address), param, compute, true);
         }
-        let Some(shadow) = crate::shadow::find(address, 1) else {
+        let Some(shadow) = crate::shadow::find_rw(address, 1, true) else {
             once!(
                 address = format_args!("{address:#x}"),
                 "a root UAV outside every host copy of title memory: dropped"
@@ -672,7 +672,7 @@ impl State {
             once!("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let shadow = address.and_then(|a| crate::shadow::find_rw(a, 1, uav).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0), uav);
         let index = match self.root_srv_slots.get(&key) {
             Some(&index) => index,
@@ -1287,7 +1287,7 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find(arguments, len) else {
+        let Some(args) = crate::shadow::find_rw(arguments, len, true) else {
             why("arguments outside title buffers");
             return false;
         };
@@ -1504,7 +1504,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     // what shaders write through unordered access goes back to it after.
     if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
+        && let Some(shadow) = crate::shadow::find_rw(address, len, u.kind == ResourceType::Uav)
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
