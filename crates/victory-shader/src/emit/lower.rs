@@ -7924,7 +7924,11 @@ impl<'a> Lower<'a> {
         if name.starts_with("image_bvh") {
             return self.bvh(inst, b, i);
         }
-        // A load or sample with no channel enabled returns the first.
+        // A load or sample with no channel enabled returns the first;
+        // an image store with no channel enabled is refused.
+        if name == "image_store" && *dmask == 0 {
+            return Err("an image store with no channels");
+        }
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
@@ -8117,11 +8121,8 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to write channels of a float format
+            // (the console converts by the view's format).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -8130,14 +8131,20 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
+            let fzero = self.s.m.f32(0);
+            let mut vals = Vec::with_capacity(4);
+            let mut idx = 0u8;
             for k in 0..4u8 {
+                if dmask >> k & 1 == 0 {
+                    vals.push(fzero);
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { idx / 2 } else { idx };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if idx % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -8147,6 +8154,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                idx += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
@@ -11019,6 +11027,94 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn partial_channel_image_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        // image_store (op 0x08), dim=1 (2D), unorm=1 (bit 12 of w0), d16 (bit 31 of w1).
+        // Test 0x0 refusal, 32-bit partial masks (0x1, 0x3, 0x5), and d16 partial mask (0x7).
+        for (dmask, d16) in [
+            (0x0u32, false),
+            (0x1, false),
+            (0x3, false),
+            (0x5, false),
+            (0x7, true),
+        ] {
+            let mimg_w0 = 0xF000_0000 | (0x08 << 18) | (1 << 12) | (dmask << 8) | (1 << 3);
+            let mimg_w1 = (u32::from(d16) << 31) | 0x0001_0200;
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx8 s[4:11], s[0:1], null
+                0xF40C_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0 (coords v0..v1, data v2..v3)
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // image_store v[2..], v[0..1], s[4:11]
+                mimg_w0,
+                mimg_w1,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            if dmask == 0 {
+                assert_eq!(
+                    out.err(),
+                    Some(crate::ShaderError::Unsupported {
+                        offset: 28,
+                        what: "an image store with no channels",
+                    })
+                );
+            } else {
+                let lowered = out.unwrap();
+                let c = crate::dxbc::Container::parse(&lowered.dxil).unwrap();
+                let sfi0 = c.part(crate::dxbc::FourCC::SFI0).unwrap().data;
+                let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+                assert_ne!(
+                    features & 0x200_0000,
+                    0,
+                    "RESOURCE_HEAP feature bit missing"
+                );
+            }
         }
     }
 }
