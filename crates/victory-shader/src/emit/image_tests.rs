@@ -59,7 +59,7 @@ const IMAGE_SAMPLE_LZ_O: u32 = 0x37;
 /// address in `s4`, the sampler table's in `s5`. It loads the UAV (view
 /// 0), the 2D texture (view 1) and sampler 0, sets the VGPRs `setup` lists
 /// ((VGPR, literal)), runs `sample` (its result in `v0`) and stores `v0`.
-fn build(setup: &[(u8, u32)], sample: [u32; 2]) -> HostShader {
+fn build(setup: &[(u8, u32)], sample: &[u32]) -> HostShader {
     let mut words = vec![
         s_mov_b32(6, 4),
         s_mov_b32(7, ZERO),
@@ -72,7 +72,7 @@ fn build(setup: &[(u8, u32)], sample: [u32; 2]) -> HostShader {
     for &(v, x) in setup {
         words.extend([v_mov(v, LITERAL), x]);
     }
-    words.extend(sample);
+    words.extend_from_slice(sample);
     words.extend(buffer_store_dword(0, 12, 0));
     words.push(S_ENDPGM);
 
@@ -144,8 +144,14 @@ fn build(setup: &[(u8, u32)], sample: [u32; 2]) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        // Constant samplers are static ones on the host, as translate_for
+        // makes them.
+        static_samplers: lowered
+            .samplers
+            .iter()
+            .map(|&w| super::StaticSampler::from_words(w))
+            .collect(),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
@@ -241,7 +247,7 @@ fn a_level_zero_sample_with_a_constant_offset_reads_the_offset_texel() {
             (4, centre(1).to_bits()),
             (5, centre(0).to_bits()),
         ],
-        mimg(IMAGE_SAMPLE_LZ_O, 0, 3, false),
+        &mimg(IMAGE_SAMPLE_LZ_O, 0, 3, false),
     );
     for (backend, got) in run(&shader) {
         assert_eq!(got, 22.0, "{backend}: texel (1, 0) offset by (1, 2)");
@@ -258,7 +264,7 @@ fn a_level_sample_with_an_offset_reads_its_level_after_the_coordinates() {
             (5, centre(3).to_bits()),
             (6, 0),
         ],
-        mimg(IMAGE_SAMPLE_L_O, 0, 3, false),
+        &mimg(IMAGE_SAMPLE_L_O, 0, 3, false),
     );
     for (backend, got) in run(&shader) {
         assert_eq!(got, 31.0, "{backend}: texel (2, 3) offset by (-1, 0)");
@@ -275,7 +281,7 @@ fn an_a16_sample_reads_its_coordinates_after_the_extra_word() {
             (4, f16(centre(3)) | f16(centre(2)) << 16),
             (5, 0),
         ],
-        mimg(IMAGE_SAMPLE_L_O, 0, 3, true),
+        &mimg(IMAGE_SAMPLE_L_O, 0, 3, true),
     );
     for (backend, got) in run(&shader) {
         assert_eq!(got, 13.0, "{backend}: texel (3, 2) offset by (0, -1)");
@@ -295,7 +301,7 @@ fn a_gradient_sample_with_a_clamp_reads_the_coordinates_after_the_gradients() {
             (8, centre(2).to_bits()),
             (9, 0),
         ],
-        mimg(IMAGE_SAMPLE_D_CL, 0, 3, false),
+        &mimg(IMAGE_SAMPLE_D_CL, 0, 3, false),
     );
     for (backend, got) in run(&shader) {
         assert_eq!(got, 21.0, "{backend}: texel (1, 2)");
@@ -311,5 +317,47 @@ fn a_cube_gradient_sample_takes_face_coordinate_gradients() {
     let setup: Vec<(u8, u32)> = (3..=10).map(|v| (v, 0)).collect();
     // The lowering takes 8 addresses (a cube's gradients were taken as 3D,
     // 10 addresses, before) and the DXIL validates where dxil.dll is.
-    build(&setup, sample);
+    build(&setup, &sample);
+}
+
+const IMAGE_GATHER4_L: u32 = 0x44;
+
+/// `image_gather4_l v[0:3], v[3:5]` of channel 0 at (u, v, level), with
+/// the constant sampler `clamp_x | clamp_y << 3` and `border` colour type
+/// set in s[24:27]; returns the stored v0, the footprint's texel (0, 1).
+fn gather_l(clamp: [u32; 2], border: u32, u: f32, v: f32, level: f32) -> Vec<(&'static str, f32)> {
+    let mut code = Vec::new();
+    for (k, w) in [clamp[0] | clamp[1] << 3, 0, 0, border << 30].into_iter().enumerate() {
+        code.extend([s_mov_b32(24 + k as u8, LITERAL), w]);
+    }
+    code.extend(mimg(IMAGE_GATHER4_L, 0, 3, false));
+    let setup = [(3, u.to_bits()), (4, v.to_bits()), (5, level.to_bits())];
+    run(&build(&setup, &code))
+}
+
+#[test]
+fn a_level_gather_reads_the_footprint_with_the_samplers_address_modes() {
+    const WRAP: u32 = 0;
+    const CLAMP: u32 = 2;
+    const BORDER: u32 = 6;
+    // u, v at texel centres (1, 2): the footprint is x 1..2, y 2..3, and
+    // texel (0, 1) of it is (1, 3) = 31. Level 2.7 clamps to the only one.
+    for (backend, got) in gather_l([CLAMP, CLAMP], 0, centre(1), centre(2), 2.7) {
+        assert_eq!(got, 31.0, "{backend}: inside");
+    }
+    // At y = 3 the footprint's second row is past the edge: (1, 4) is
+    // clamped to (1, 3) = 31, wraps to (1, 0) = 1, or reads the border.
+    let edge = |clamp, border| gather_l([CLAMP, clamp], border, centre(1), centre(3), 0.0);
+    for (backend, got) in edge(CLAMP, 0) {
+        assert_eq!(got, 31.0, "{backend}: clamped");
+    }
+    for (backend, got) in edge(WRAP, 0) {
+        assert_eq!(got, 1.0, "{backend}: wrapped");
+    }
+    for (backend, got) in edge(BORDER, 0) {
+        assert_eq!(got, 0.0, "{backend}: transparent black border");
+    }
+    for (backend, got) in edge(BORDER, 2) {
+        assert_eq!(got, 1.0, "{backend}: white border");
+    }
 }

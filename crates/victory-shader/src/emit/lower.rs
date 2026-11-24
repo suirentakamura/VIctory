@@ -7148,6 +7148,8 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // At an explicit level: four texel loads (see `gather_at_level`).
+            "image_gather4_l" | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7432,6 +7434,37 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
+                    if name.starts_with("image_gather4_l_") || name == "image_gather4_l" {
+                        if kind != 2 || *d16 {
+                            return Err("a level gather of another dimension or d16");
+                        }
+                        let Source::Constant(words) = ss else {
+                            return Err("a level gather with a sampler from memory");
+                        };
+                        let words: [u32; 4] = words
+                            .get(..4)
+                            .and_then(|w| w.try_into().ok())
+                            .ok_or("a sampler constant")?;
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        let zero = self.s.m.i32(0);
+                        let (ox, oy) = if offset_word { (os[0], os[1]) } else { (zero, zero) };
+                        let Operand::Vector { reg, .. } = *data else {
+                            return Err("an image result");
+                        };
+                        let texels = self.gather_at_level(
+                            h,
+                            [cs[0], cs[1]],
+                            lod,
+                            [ox, oy],
+                            words,
+                            dmask.trailing_zeros(),
+                        )?;
+                        for (k, x) in texels.into_iter().enumerate() {
+                            self.write(inst, Reg::V(reg + k as u8), x, guard);
+                        }
+                        return Ok(());
+                    }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
                     self.s.op(
@@ -7517,6 +7550,117 @@ impl<'a> Lower<'a> {
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
     // operand adds 8 × the slice).
+    /// `image_gather4_l`: channel `ch` of the four texels a bilinear fetch
+    /// of 2D texture `h` at normalized `uv` would read, at level `lod`
+    /// (rounded to the nearest, clamped to the texture's), moved by texel
+    /// offsets `off`, in gather order (0, 1), (1, 1), (1, 0), (0, 0). DXIL
+    /// gathers have no level, so the texels are loaded one by one, with
+    /// the constant sampler's address modes applied here: wrap, clamp to
+    /// the last texel, or a black or white border.
+    fn gather_at_level(
+        &mut self,
+        h: V,
+        uv: [V; 2],
+        lod: V,
+        off: [V; 2],
+        words: [u32; 4],
+        ch: u32,
+    ) -> Result<[V; 4], Why> {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let f32t = self.s.t.f32;
+        let iu = self.s.m.undef(i32t);
+        let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let modes = [words[0] & 7, words[0] >> 3 & 7];
+        // Border colour: transparent black, opaque black, opaque white.
+        let border = match words[3] >> 30 {
+            0 => 0.0,
+            1 if ch == 3 => 1.0,
+            1 => 0.0,
+            2 => 1.0,
+            _ => return Err("a level gather with a border colour from the table"),
+        };
+        if modes.iter().any(|m| !matches!(m, 0 | 2 | 4 | 6)) {
+            return Err("a level gather with a mirrored address mode");
+        }
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let half = self.s.m.f32(0.5f32.to_bits());
+        // The level: nearest, within the texture's levels.
+        let l = self.s.m.bin(c, Bin::Add, lod, half);
+        let l = self.unary(27, l);
+        let l = self.s.m.cast(c, Cast::FpToSi, l, i32t);
+        let d0 = self.s.op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
+        let last = self.s.m.extract(c, d0, 3);
+        let last = self.s.m.bin(c, Bin::Sub, last, one);
+        let neg = self.s.m.cmp(c, pred::SLT, l, zero);
+        let l = self.s.m.select(c, neg, zero, l);
+        let over = self.s.m.cmp(c, pred::SGT, l, last);
+        let level = self.s.m.select(c, over, last, l);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
+        // The footprint's first texel on each axis, and the axis size.
+        let mut first = [zero; 2];
+        let mut size = [zero; 2];
+        for k in 0..2 {
+            let n = self.s.m.extract(c, d, k as u32);
+            size[k] = n;
+            let nf = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, uv[k], nf);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            let x = self.unary(27, x);
+            let x = self.s.m.cast(c, Cast::FpToSi, x, i32t);
+            first[k] = self.s.m.bin(c, Bin::Add, x, off[k]);
+        }
+        let border = self.s.m.f32((border as f32).to_bits());
+        let mut out = [zero; 4];
+        for (n, [dx, dy]) in [[0, 1], [1, 1], [1, 0], [0, 0]].into_iter().enumerate() {
+            let mut at = [zero; 2];
+            let mut inside = None;
+            for (k, step) in [dx, dy].into_iter().enumerate() {
+                let step = self.s.m.i32(step);
+                let i = self.s.m.bin(c, Bin::Add, first[k], step);
+                let n = size[k];
+                let last = self.s.m.bin(c, Bin::Sub, n, one);
+                at[k] = match modes[k] {
+                    0 => {
+                        // Wrap: offsets keep i above -64 texels.
+                        let k64 = self.s.m.i32(64);
+                        let lift = self.s.m.bin(c, Bin::Mul, n, k64);
+                        let i = self.s.m.bin(c, Bin::Add, i, lift);
+                        self.s.m.bin(c, Bin::URem, i, n)
+                    }
+                    m => {
+                        if m != 2 {
+                            // Border: texels off the level read the colour.
+                            let ok = self.s.m.cmp(c, pred::IULT, i, n);
+                            inside = Some(match inside {
+                                Some(x) => self.s.m.bin(c, Bin::And, x, ok),
+                                None => ok,
+                            });
+                        }
+                        let lo = self.s.m.cmp(c, pred::SLT, i, zero);
+                        let i = self.s.m.select(c, lo, zero, i);
+                        let hi = self.s.m.cmp(c, pred::SGT, i, last);
+                        self.s.m.select(c, hi, last, i)
+                    }
+                };
+            }
+            let r = self.s.op(
+                c,
+                "textureLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                66,
+                &[h, level, at[0], at[1], iu, iu, iu, iu],
+            );
+            let mut x = self.s.m.extract(c, r, ch);
+            if let Some(ok) = inside {
+                x = self.s.m.select(c, ok, x, border);
+            }
+            out[n] = self.as_int(x);
+        }
+        Ok(out)
+    }
+
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
