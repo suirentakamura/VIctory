@@ -663,29 +663,103 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    // Under Wine every view mapped or unmapped is a wineserver request that
+    // walks all of the process's views; mapping page by page and anew each
+    // time left the whole title waiting on it in the world (thousands of
+    // views, most mapped again unchanged each frame).
+    if from != 0 && len != 0 && shows(&physical, to, from, len) {
+        return true;
+    }
     unmap(&mut physical, to, len);
+    if from == 0 {
+        return true;
+    }
+    // Pages that follow on in one section become one view.
+    let mut run: Option<(usize, usize, Slice)> = None; // (address, bytes, first)
     for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+        let Some(slice) = source(&physical, from + k) else {
+            if let Some((at, n, first)) = run {
+                map_run(&mut physical, at, n, first);
+            }
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        match &mut run {
+            Some((_, n, first))
+                if Arc::ptr_eq(&first.section, &slice.section)
+                    && first.index + *n / PAGE == slice.index =>
+            {
+                *n += PAGE;
+            }
+            _ => {
+                if let Some((at, n, first)) = run.take()
+                    && !map_run(&mut physical, at, n, first)
+                {
+                    return false;
+                }
+                run = Some((to + k, PAGE, slice));
+            }
         }
     }
+    match run {
+        Some((at, n, first)) => map_run(&mut physical, at, n, first),
+        None => true,
+    }
+}
+
+/// [`map`] over `[base, base + len)`, a piece per placeholder it spans
+/// (pages unmapped one by one stay placeholders of their own).
+fn map_run(physical: &mut Physical, base: usize, len: usize, first: Slice) -> bool {
+    let end = base + len;
+    let mut at = base;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: plain data filled in by the query.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                at as *const c_void,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let piece_end = if queried == 0 {
+            at + PAGE
+        } else {
+            (info.BaseAddress as usize + info.RegionSize).clamp(at + PAGE, end)
+        };
+        let slice = Slice {
+            index: first.index + (at - base) / PAGE,
+            section: first.section.clone(),
+        };
+        if !map(physical, at, piece_end - at, slice) {
+            return false;
+        }
+        at = piece_end;
+    }
     true
+}
+
+/// The section page a mapped address shows.
+fn source(physical: &Physical, at: usize) -> Option<Slice> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (at - base) / PAGE,
+            section: s.section.clone(),
+        })
+}
+
+/// Whether `[to, to + len)` already shows the pages at `from`, page for page.
+fn shows(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    (0..len).step_by(PAGE).all(|k| {
+        match (source(physical, to + k), source(physical, from + k)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.section, &b.section) && a.index == b.index,
+            _ => false,
+        }
+    })
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
