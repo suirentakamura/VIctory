@@ -893,7 +893,7 @@ mod tests {
             emit_for(&two, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
+                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
         // The same code in waves of 32 runs on either.

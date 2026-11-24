@@ -210,6 +210,15 @@ fn console_flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32)
 /// [`console_flow_case`], checking hosts with 64-lane waves (the per-lane
 /// form) only when `native` says.
 fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32, native: bool) {
+    program_case(label, &program(body, threads), want, native);
+}
+
+/// [`flow_case`] of a program built by the caller.
+fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32, native: bool) {
+    let StageIo::Cs(io) = &p.io else {
+        unreachable!()
+    };
+    let threads = io.threads[0];
     let Ok(names) = adapters() else {
         eprintln!("no DXGI; skipped");
         return;
@@ -218,10 +227,9 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         let Ok(host) = Host::on(&name) else {
             continue;
         };
-        let p = program(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
-        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        let out = run(&host, p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
         let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
         if !split && !native {
             if out != expect {
@@ -407,4 +415,86 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
+/// [`program`] with 512 bytes of LDS.
+fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 1 << 15;
+    p
+}
+
+/// One console wave sharing LDS without `s_barrier`: the console runs each
+/// instruction in all 64 lanes before the next, so a lane reads what a lane
+/// of the other half wrote one instruction earlier. Lane t writes t to
+/// dword t, then reads dword 63 - t; then writes that plus 50 to dword t
+/// and reads dword t ^ 32.
+#[test]
+fn one_wave_shares_lds_in_instruction_order() {
+    let body = [
+        0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xD8D8_0000,
+        0x0700_0006, // ds_read_b32 v7, v6
+        0x4A0E_0EB2, // v_add_nc_u32 v7, 50, v7
+        0xD834_0000,
+        0x0000_0704, // ds_write_b32 v4, v7
+        0x3A10_00A0, // v_xor_b32 v8, 32, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0xD8D8_0000,
+        0x0200_0008, // ds_read_b32 v2, v8
+    ];
+    // Dword u holds (63 - u) + 50 after the second write.
+    program_case(
+        "LDS in instruction order",
+        &program_lds(&body, 64),
+        |t| (63 - (t ^ 32)) + 50,
+        true,
+    );
+}
+
+/// The same sharing with the halves pulled apart: only the lower half does
+/// 48 buffer stores before its LDS write, so without a barrier the upper
+/// half's read of the lower half's dword can come first. Lane t writes t to
+/// dword t and reads dword 63 - t.
+///
+/// On an RTX 5070 both LDS tests also pass with the barrier before each LDS
+/// access left out: that card keeps the two waves in step for these
+/// programs. They check that the form gives the console's result, not that
+/// the barrier is what gives it; D3D12 promises no order between a group's
+/// waves without one.
+#[test]
+fn lds_order_holds_when_one_half_is_busy() {
+    let mut body = vec![
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0
+        0x4A12_1208, // v_add_nc_u32 v9, s8, v9
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ];
+    for _ in 0..48 {
+        // buffer_store_dword v0, v9, s[4:7], 0 offen
+        body.extend_from_slice(&[0xE070_1000, 0x8001_0009]);
+    }
+    body.extend_from_slice(&[
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xD8D8_0000,
+        0x0200_0006, // ds_read_b32 v2, v6
+    ]);
+    program_case(
+        "LDS order with a busy lower half",
+        &program_lds(&body, 64),
+        |t| 63 - t,
+        true,
+    );
 }

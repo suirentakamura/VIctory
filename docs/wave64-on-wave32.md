@@ -3,8 +3,9 @@
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+half, divergent branches and loops, and LDS shared in the console's
+instruction order. Still open: groups of several console waves, whole-wave
+sections and `ds_(b)permute`; each stops with its own reason.
 
 ## The problem
 
@@ -116,8 +117,23 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
+waves, at most 64 threads per group, no `ds_(b)permute`, and no
 whole-wave sections.
+
+**LDS.** The console runs an instruction in all 64 lanes before the next,
+so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
+other half wrote one instruction earlier. In the console flow both halves
+reach every LDS access together, so a group barrier before each access puts
+it after every earlier one. This also takes the programs that needed 64-lane
+waves only for that (one console wave per group, LDS, no cross-lane read).
+Two testers' counts on the title put those first: 120 of the 223 programs
+#233 still stopped on a 32-lane host. On an RTX 5070 the LDS tests pass
+without the barrier too (that card keeps the two waves in step), so they
+check the result, not the need for the barrier.
+
+What still stops says why: `console wave64 lanes in a group of more than 64
+threads`, `ds_permute across the halves`, or `a whole-wave section`, each
+`on a host without 64-lane waves`.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
@@ -172,7 +188,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
+   console flow).~~ Then multi-wave groups (counters).
 
 ## Credit
 
