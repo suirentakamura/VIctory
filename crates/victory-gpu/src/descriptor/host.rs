@@ -25,7 +25,8 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
+    /// The record (view index and generation) each slot was last made from
+    /// ([`LATER`] set: seen, a buffer view not made until a draw reads it).
     made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -153,6 +154,10 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
+
+/// Marks a slot's key in `HostHeap::made` as a buffer view seen but not
+/// made yet (generations are far below 2^31).
+const LATER: u64 = 1 << 63;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -563,9 +568,18 @@ impl HostHeap {
             }
             return None;
         };
+        // A buffer view the title wrote, seen outside a draw, is made at
+        // the first draw that reads it: until then the slot holds a null
+        // view and its key carries `LATER`, so looking again (the heap
+        // sweep before every submission) has nothing to do. Remaking the
+        // null view each time cost a third of the submitting thread in the
+        // world.
+        if !for_draw && made[index as usize] == key | LATER {
+            return Some(view);
+        }
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
+            made[index as usize] = if later { key | LATER } else { key };
             let kept = if later {
                 None
             } else {
@@ -592,6 +606,9 @@ impl HostHeap {
             .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
+        }
+        if key & LATER != 0 {
+            return Some("null (a buffer view made at its first draw)".into());
         }
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
