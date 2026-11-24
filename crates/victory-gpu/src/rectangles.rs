@@ -24,6 +24,12 @@
 //! access, so the next indirect rectangle draw of the list reuses the whole
 //! scratch.
 //!
+//! Both passes are HLSL compiled at run time by the system's `D3DCompile`:
+//! Microsoft's, or Wine's (vkd3d-shader) under Wine and Proton. So they read
+//! buffers as 32-bit words and take their root signatures from code, which
+//! both compilers accept (vkd3d-shader has no `Load` on
+//! `RWByteAddressBuffer` and ignores the `RootSignature` attribute).
+//!
 //! shortcut: the per-list vertex scratch has a fixed capacity of 8 MiB
 //! ([`RECT_SCRATCH_BYTES`]), shared by the records of one draw; records whose
 //! expanded vertices do not fit draw nothing. Raise it if a single indirect
@@ -217,7 +223,6 @@ pub(crate) fn dispatch_grid(records: u32) -> (u32, u32) {
 }
 
 const REWRITE_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 cbuffer Params : register(b0) {
     uint records;
     uint src_stride;
@@ -228,25 +233,35 @@ cbuffer Params : register(b0) {
     uint pad0;
     uint pad1;
 };
-RWByteAddressBuffer src_args : register(u0);
-RWByteAddressBuffer count_buf : register(u1);
-RWByteAddressBuffer alloc : register(u2);
-RWByteAddressBuffer dst_args : register(u3);
+// Buffers as 32-bit words, and no root signature attribute: Wine's system
+// compiler (vkd3d-shader) has no Load on RWByteAddressBuffer and ignores the
+// attribute, so the root signatures are made in code (`root_signature`).
+RWStructuredBuffer<uint> src_args : register(u0);
+RWStructuredBuffer<uint> count_buf : register(u1);
+RWStructuredBuffer<uint> alloc : register(u2);
+RWStructuredBuffer<uint> dst_args : register(u3);
 
-[RootSignature(RS)]
+void store4(uint at, uint4 v) {
+    dst_args[at] = v.x;
+    dst_args[at + 1u] = v.y;
+    dst_args[at + 2u] = v.z;
+    dst_args[at + 3u] = v.w;
+}
+
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint r = id.x;
     if (r >= records) return;
-    uint dst_at = r * 16u;
+    uint dst_at = r * 4u;
     if (has_count != 0u) {
-        uint live = count_buf.Load(0u);
+        uint live = count_buf[0];
         if (r >= live) {
-            dst_args.Store4(dst_at, uint4(0u, 0u, 0u, 0u));
+            store4(dst_at, uint4(0u, 0u, 0u, 0u));
             return;
         }
     }
-    uint4 rec = src_args.Load4(r * src_stride);
+    uint at = r * (src_stride / 4u);
+    uint4 rec = uint4(src_args[at], src_args[at + 1u], src_args[at + 2u], src_args[at + 3u]);
     // The clamp's bounds again: 2^24 vertices, 2^26 vertex instances.
     rec.x = min(rec.x, 1u << 24);
     rec.y = min(rec.y, (1u << 26) / max(rec.x, 1u));
@@ -261,7 +276,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             out_verts = 0u;
         } else {
             uint before;
-            alloc.InterlockedAdd(0u, out_verts, before);
+            InterlockedAdd(alloc[0], out_verts, before);
             if (before >= vert_capacity || out_verts > vert_capacity - before) {
                 out_verts = 0u;
             } else {
@@ -269,12 +284,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
-    dst_args.Store4(dst_at, uint4(out_verts, rec.y, out_start, rec.w));
+    store4(dst_at, uint4(out_verts, rec.y, out_start, rec.w));
 }
 "#;
 
 const EXPAND_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 cbuffer Params : register(b0) {
     uint records;
     uint src_stride;
@@ -285,43 +299,45 @@ cbuffer Params : register(b0) {
     uint elem_count;
     uint pad0;
 };
-ByteAddressBuffer elems : register(t0);
-RWByteAddressBuffer src_args : register(u0);
-RWByteAddressBuffer dst_args : register(u1);
-RWByteAddressBuffer src_vb : register(u2);
-RWByteAddressBuffer dst_vb : register(u3);
+// Buffers as 32-bit words (see the rewrite pass); byte positions are
+// turned into word indices here.
+StructuredBuffer<uint> elems : register(t0);
+RWStructuredBuffer<uint> src_args : register(u0);
+RWStructuredBuffer<uint> dst_args : register(u1);
+RWStructuredBuffer<uint> src_vb : register(u2);
+RWStructuredBuffer<uint> dst_vb : register(u3);
 
 uint load_u8(uint pos) {
-    uint w = src_vb.Load(pos & ~3u);
+    uint w = src_vb[(pos & ~3u) >> 2u];
     return (w >> ((pos & 3u) * 8u)) & 0xffu;
 }
 
 uint load_u16(uint pos) {
     uint rem = pos & 3u;
-    uint w0 = src_vb.Load(pos & ~3u);
+    uint w0 = src_vb[(pos & ~3u) >> 2u];
     if (rem <= 2u) {
         return (w0 >> (rem * 8u)) & 0xffffu;
     }
-    uint w1 = src_vb.Load((pos & ~3u) + 4u);
+    uint w1 = src_vb[((pos & ~3u) + 4u) >> 2u];
     return ((w0 >> 24u) | (w1 << 8u)) & 0xffffu;
 }
 
 uint load_u32(uint pos) {
     uint rem = pos & 3u;
-    uint w0 = src_vb.Load(pos & ~3u);
+    uint w0 = src_vb[(pos & ~3u) >> 2u];
     if (rem == 0u) {
         return w0;
     }
-    uint w1 = src_vb.Load((pos & ~3u) + 4u);
+    uint w1 = src_vb[((pos & ~3u) + 4u) >> 2u];
     return (w0 >> (rem * 8u)) | (w1 << ((4u - rem) * 8u));
 }
 
 void store_u8(uint pos, uint val) {
     uint aligned = pos & ~3u;
     uint shift = (pos & 3u) * 8u;
-    uint w = dst_vb.Load(aligned);
+    uint w = dst_vb[aligned >> 2u];
     w = (w & ~(0xffu << shift)) | ((val & 0xffu) << shift);
-    dst_vb.Store(aligned, w);
+    dst_vb[aligned >> 2u] = w;
 }
 
 void store_u16(uint pos, uint val) {
@@ -329,9 +345,9 @@ void store_u16(uint pos, uint val) {
     if (rem <= 2u) {
         uint aligned = pos & ~3u;
         uint shift = rem * 8u;
-        uint w = dst_vb.Load(aligned);
+        uint w = dst_vb[aligned >> 2u];
         w = (w & ~(0xffffu << shift)) | ((val & 0xffffu) << shift);
-        dst_vb.Store(aligned, w);
+        dst_vb[aligned >> 2u] = w;
     } else {
         store_u8(pos, val & 0xffu);
         store_u8(pos + 1u, (val >> 8u) & 0xffu);
@@ -341,25 +357,25 @@ void store_u16(uint pos, uint val) {
 void store_u32(uint pos, uint val) {
     uint rem = pos & 3u;
     if (rem == 0u) {
-        dst_vb.Store(pos, val);
+        dst_vb[pos >> 2u] = val;
     } else {
         uint aligned = pos & ~3u;
         uint shift = rem * 8u;
         uint inv = (4u - rem) * 8u;
         uint mask = (1u << shift) - 1u;
-        uint w0 = dst_vb.Load(aligned);
+        uint w0 = dst_vb[aligned >> 2u];
         w0 = (w0 & mask) | (val << shift);
-        dst_vb.Store(aligned, w0);
-        uint w1 = dst_vb.Load(aligned + 4u);
+        dst_vb[aligned >> 2u] = w0;
+        uint w1 = dst_vb[(aligned + 4u) >> 2u];
         w1 = (w1 & ~mask) | (val >> inv);
-        dst_vb.Store(aligned + 4u, w1);
+        dst_vb[(aligned + 4u) >> 2u] = w1;
     }
 }
 
 void copy_vertex(uint src_off, uint dst_off) {
     uint full = vb_src_stride & ~3u;
     for (uint b = 0u; b < full; b += 4u) {
-        dst_vb.Store(dst_off + b, load_u32(src_off + b));
+        dst_vb[(dst_off + b) >> 2u] = load_u32(src_off + b);
     }
     uint rem = vb_src_stride & 3u;
     if (rem != 0u) {
@@ -367,7 +383,7 @@ void copy_vertex(uint src_off, uint dst_off) {
         for (uint k = 0u; k < rem; k++) {
             w |= load_u8(src_off + full + k) << (k * 8u);
         }
-        dst_vb.Store(dst_off + full, w);
+        dst_vb[(dst_off + full) >> 2u] = w;
     }
 }
 
@@ -428,16 +444,15 @@ void write_comp(uint kind, uint pos, float v) {
     }
 }
 
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint r = gid.y * grid_x + gid.x;
     if (r >= records) return;
-    uint out_verts = dst_args.Load(r * 16u);
+    uint out_verts = dst_args[r * 4u];
     uint rects = out_verts / 6u;
     if (rects == 0u) return;
-    uint dst_start = dst_args.Load(r * 16u + 8u);
-    uint src_start = src_args.Load(r * src_stride + 8u);
+    uint dst_start = dst_args[r * 4u + 2u];
+    uint src_start = src_args[r * (src_stride / 4u) + 2u];
 
     for (uint rect = gtid.x; rect < rects; rect += 64u) {
         uint v0_src = vb_src_bias + (src_start + rect * 3u) * vb_src_stride;
@@ -454,7 +469,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         copy_vertex(v0_src, v3_dst);
 
         for (uint e = 0u; e < elem_count; e++) {
-            uint2 desc = elems.Load2(e * 8u);
+            uint2 desc = uint2(elems[e * 2u], elems[e * 2u + 1u]);
             uint offset = desc.x;
             uint kind = desc.y & 0xffu;
             uint comp_count = desc.y >> 8u;
@@ -539,17 +554,71 @@ fn compile_blob(
     code.ok_or_else(|| (windows::core::Error::empty(), String::new()))
 }
 
+/// A pass's root signature: eight root constants at `b0`, then one root
+/// descriptor per entry of `views`, registers counted per kind from 0.
+fn root_signature(
+    device: &ID3D12Device,
+    views: &[D3D12_ROOT_PARAMETER_TYPE],
+) -> windows::core::Result<ID3D12RootSignature> {
+    let mut params = vec![D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                Num32BitValues: 8,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }];
+    let (mut srv, mut uav) = (0, 0);
+    for &kind in views {
+        let counter = if kind == D3D12_ROOT_PARAMETER_TYPE_SRV {
+            &mut srv
+        } else {
+            &mut uav
+        };
+        params.push(D3D12_ROOT_PARAMETER {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: *counter,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        *counter += 1;
+    }
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    // SAFETY: a description of root constants and root descriptors that
+    // lives through the call; the out pointer is ours.
+    unsafe {
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 fn compile_pass(
     device: &ID3D12Device,
     name: windows::core::PCSTR,
     source: &str,
+    views: &[D3D12_ROOT_PARAMETER_TYPE],
 ) -> windows::core::Result<Pass> {
     let code = compile_blob(name, source).map_err(|(e, _)| e)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device, views)?;
+    // SAFETY: the blob's own bytes, and a root signature of ours.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -564,8 +633,15 @@ fn compile_pass(
 
 fn make() -> windows::core::Result<Shaders> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let rewrite = compile_pass(device, s!("rect_rewrite"), REWRITE_SOURCE)?;
-    let expand = compile_pass(device, s!("rect_expand"), EXPAND_SOURCE)?;
+    const UAV: D3D12_ROOT_PARAMETER_TYPE = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    const SRV: D3D12_ROOT_PARAMETER_TYPE = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    let rewrite = compile_pass(device, s!("rect_rewrite"), REWRITE_SOURCE, &[UAV; 4])?;
+    let expand = compile_pass(
+        device,
+        s!("rect_expand"),
+        EXPAND_SOURCE,
+        &[SRV, UAV, UAV, UAV, UAV],
+    )?;
     Ok(Shaders { rewrite, expand })
 }
 
@@ -940,18 +1016,17 @@ mod tests {
         assert!(shaders().is_some());
     }
 
-    /// Both HLSL shaders compile with `D3DCompile` when the host compiler
-    /// supports `cs_5_1` raw buffers (`RWByteAddressBuffer::Load`).
+    /// Both HLSL shaders compile with the system's `D3DCompile`: Microsoft's,
+    /// or Wine's (vkd3d-shader), which is why they read buffers as words.
     #[test]
     fn hlsl_compiles() {
         let probe = r#"
-            RWByteAddressBuffer b : register(u0);
-            [RootSignature("UAV(u0)")]
+            RWStructuredBuffer<uint> b : register(u0);
             [numthreads(1, 1, 1)]
-            void main() { b.Store(0, b.Load(0)); }
+            void main() { uint w; InterlockedAdd(b[0], b[1], w); b[2] = w; }
         "#;
         if compile_blob(s!("probe"), probe).is_err() {
-            return; // compiler here (e.g. Wine's vkd3d-shader) lacks RWByteAddressBuffer::Load
+            return; // no usable system compiler here
         }
         if let Err((e, msg)) = compile_blob(s!("rect_rewrite"), REWRITE_SOURCE) {
             panic!("rect_rewrite HLSL failed ({e}): {msg}");
