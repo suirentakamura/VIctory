@@ -5623,7 +5623,9 @@ impl<'a> Lower<'a> {
         let h = match src {
             Source::Loaded { load, first } => {
                 let index = self.heap_index(*load, *first, false)?;
-                self.s.heap_handle(self.cur, index, false, props)
+                // Per lane in a waterfall loop, as `handle` makes it.
+                let per_lane = self.x.res.waterfall.loads.contains(load);
+                self.s.heap_handle(self.cur, index, false, per_lane, props)
             }
             _ => self.handle(site, src, false, props)?,
         };
