@@ -323,3 +323,21 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
     ];
     flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
 }
+
+/// DPP's row mask names the console's rows: with `row_mask:0x3` only
+/// rows 0 and 1 (lanes 0 to 31) write, so the upper half keeps its value
+/// although its host rows are 0 and 1 too.
+#[test]
+fn dpp_row_masks_name_console_rows() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7E04_02FA,
+        0x3F00_E400, // v_mov_b32_dpp v2, v0 quad_perm:[0,1,2,3] row_mask:0x3 bank_mask:0xf
+    ];
+    console_flow_case(
+        "DPP row_mask 0x3",
+        &body,
+        64,
+        |t| if t < 32 { t } else { 1 },
+    );
+}
