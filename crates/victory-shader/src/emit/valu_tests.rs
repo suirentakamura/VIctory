@@ -1426,7 +1426,7 @@ fn s_lshl_add_sets_scc_on_unsigned_overflow() {
     );
 }
 
-/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 offen` (a load).
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 offen` (a load or a store).
 const fn buffer_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [
         0x38 << 26 | (op as u32) << 18 | 1 << 12,
@@ -1459,6 +1459,40 @@ fn buffer_byte_and_short_loads_extend_as_the_console() {
         }
         run_cases(&shader, &cases, |backend, _, [w, at, ..], got| {
             assert_eq!(got, want(w, at), "{backend}: op {op:#x} of {w:#010x} at byte {at}");
+        });
+    }
+}
+
+#[test]
+fn buffer_byte_and_short_stores_keep_the_rest_of_the_dword() {
+    const STORE_BYTE: u8 = 0x18;
+    const STORE_BYTE_D16_HI: u8 = 0x19;
+    const STORE_SHORT: u8 = 0x1A;
+    const STORE_SHORT_D16_HI: u8 = 0x1B;
+    const LOAD_DWORD: u8 = 0x0C;
+    // Dword 0 holds s0; s2 is stored over it at byte s1, then the dword is
+    // read back (v4 = s3 = 0).
+    let stores: [(u8, u32, bool); 4] = [
+        (STORE_BYTE, 8, false),
+        (STORE_BYTE_D16_HI, 8, true),
+        (STORE_SHORT, 16, false),
+        (STORE_SHORT_D16_HI, 16, true),
+    ];
+    for (op, width, high) in stores {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(buffer_load_offen(op, 3, 2, 8));
+        body.extend(buffer_load_offen(LOAD_DWORD, 0, 4, 8));
+        let shader = build_valu_cs(&body);
+        let ats: &[u32] = if width == 16 { &[0, 2] } else { &[0, 1, 2, 3] };
+        let cases: Vec<[u32; 4]> = ats
+            .iter()
+            .flat_map(|&at| [[0x8081_7F42, at, 0xA5C3_E1F0, 0], [0x1234_F00D, at, 0x0000_00FF, 0]])
+            .collect();
+        run_cases(&shader, &cases, |backend, _, [w, at, x, _], got| {
+            let x = if high { x >> 16 } else { x };
+            let mask = (u32::MAX >> (32 - width)) << (8 * at);
+            let want = w & !mask | (x << (8 * at)) & mask;
+            assert_eq!(got, want, "{backend}: op {op:#x} of {x:#x} at byte {at} over {w:#010x}");
         });
     }
 }

@@ -7485,13 +7485,22 @@ impl<'a> Lower<'a> {
             Some("sshort") => Some((16, true)),
             _ => None,
         };
+        // A byte or short store, of the low or the high half of its VGPR
+        // (width, high).
+        let narrow_store = match plain.strip_prefix("buffer_store_") {
+            Some("byte") => Some((8, false)),
+            Some("short") => Some((16, false)),
+            Some("byte_d16_hi") => Some((8, true)),
+            Some("short_d16_hi") => Some((16, true)),
+            _ => None,
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
-            _ if sub.is_some() => (false, 1),
+            _ if sub.is_some() || narrow_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7539,7 +7548,7 @@ impl<'a> Lower<'a> {
         // shortcut: as for global loads, a byte or short field is taken not
         // to cross a dword: the dword is read at the offset rounded down,
         // and the field shifted out of it.
-        let narrow = match sub {
+        let narrow = match sub.or(narrow_store.map(|(w, _)| (w, false))) {
             Some((width, signed)) => {
                 let (three, not3) = (self.s.m.i32(3), self.s.m.i32(!3));
                 let byte = self.s.m.bin(c, Bin::And, off, three);
@@ -7642,6 +7651,48 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let (Some((_, high)), Some((shift, width, _))) = (narrow_store, narrow) {
+            // The field is cleared and then set with two atomics on its
+            // dword, so lanes storing the dword's other bytes keep theirs.
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let mut x = self.vgprs(inst, d, 1)?[0];
+            if high {
+                let k16 = self.s.m.i32(16);
+                x = self.s.m.bin(c, Bin::LShr, x, k16);
+            }
+            let bits = self.s.m.i32(u32::MAX >> (32 - width));
+            let x = self.s.m.bin(c, Bin::And, x, bits);
+            let x = self.s.m.bin(c, Bin::Shl, x, shift);
+            let field = self.s.m.bin(c, Bin::Shl, bits, shift);
+            let all = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, field, all);
+            let (h, coords) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        (
+                            self.handle(site, src, false, (12 | u, stride))?,
+                            [index, off, iu],
+                        )
+                    } else {
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                        (h, [byte, iu, iu])
+                    }
+                }
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+            };
+            let at = self.begin_guarded(guard);
+            let i32t = self.s.t.i32;
+            for (op, value) in [(1, keep), (2, x)] {
+                let mut args = vec![h, self.s.m.i32(op)];
+                args.extend(coords);
+                args.push(value);
+                self.s
+                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if store {
