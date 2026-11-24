@@ -1654,6 +1654,11 @@ impl<'a> Lower<'a> {
             111,
             &[],
         );
+        self.mask_bit(at, lane, lo, hi)
+    }
+
+    /// Bit `lane` of the mask `lo`, `hi` (wave64).
+    fn mask_bit(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -2061,7 +2066,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    /// LDS (thread-group shared memory) and `ds_swizzle`.
+    /// LDS (thread-group shared memory), `ds_swizzle` and `ds_bpermute`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
             dst,
@@ -2124,6 +2129,41 @@ impl<'a> Lower<'a> {
                 self.read_lane(x, src)
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_bpermute_b32" {
+            // Backward (pull) permute: each active lane reads `data0` from
+            // lane `((addr + offset) >> 2) & (wave - 1)`, or 0 if that source
+            // lane is inactive. Uses the DS crossbar without LDS memory.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let at = if offset != 0 {
+                let o = self.s.m.i32(offset);
+                self.s.m.bin(c, Bin::Add, a, o)
+            } else {
+                a
+            };
+            let two = self.s.m.i32(2);
+            let shifted = self.s.m.bin(c, Bin::LShr, at, two);
+            let mask = self.s.m.i32(if self.x.native.wave64 { 63 } else { 31 });
+            let src = self.s.m.bin(c, Bin::And, shifted, mask);
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let four = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let hi = self.x.native.wave64.then(|| self.s.m.extract(c, ballot, 1));
+            let live = self.mask_bit(c, src, lo, hi);
+            let read = self.read_lane(x, src);
+            let z = self.s.m.i32(0);
+            let r = self.s.m.select(c, live, read, z);
+            let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
@@ -7324,6 +7364,86 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn ds_bpermute_lowers_without_lds_in_wave32_and_wave64() {
+        // ds_bpermute_b32 v2, v0, v1 offset:12 (DS opcode 0x0b3; no LDS allocated),
+        // consumed by a branch so lowering must actually emit the permute.
+        let bpermute = |vdst: u8, vaddr: u8, vdata: u8, off: u16| -> [u32; 2] {
+            [
+                0xD800_0000 | (0x0B3 << 18) | u32::from(off),
+                u32::from(vdst) << 24 | u32::from(vdata) << 8 | u32::from(vaddr),
+            ]
+        };
+        let mut words = vec![
+            0x7E02_0285, // v_mov_b32 v1, 5
+        ];
+        words.extend_from_slice(&bpermute(2, 0, 1, 12));
+        words.extend_from_slice(&[
+            0x7E00_0502, // v_readfirstlane_b32 s0, v2
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for wave64 in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: code.clone(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let mut lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut lowered.dxil).unwrap();
+            }
+            let _ = &lowered.dxil;
+        }
+    }
+
+    #[test]
+    fn ds_bpermute_refuses_gds() {
+        // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+        let words = [
+            0x7E02_0285,                           // v_mov_b32 v1, 5
+            0xD800_0000 | (0x0B3 << 18) | 1 << 17, // ds_bpermute_b32 gds
+            2 << 24 | 1 << 8,
+            0x7E00_0502, // v_readfirstlane_b32 s0, v2
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lowers(&words, 0),
+            Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+        ));
     }
 
     #[test]
