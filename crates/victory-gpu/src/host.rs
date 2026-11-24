@@ -1707,7 +1707,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
@@ -1723,6 +1723,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         moved.elapsed().as_micros() as u64,
     );
     if whole {
+        return;
+    }
+    // The kernel reports an unmapped destination as it does a source, so
+    // `VirtualQuery` (which walks page tables to the region's end, ~1 ms a
+    // copy in the title's pools, ~100 ms per world frame) is asked only
+    // after a failure: a destination not all mapped is left alone.
+    if title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -1802,17 +1809,56 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// `NtWriteVirtualMemory`, looked up once. `WriteProcessMemory` asks the
+/// kernel about the destination's region first (to flush the instruction
+/// cache of executable memory), which in the title's big pools walks page
+/// tables for about 2 ms a call: the copy back after a world submission
+/// spent over a second there. The system call itself writes the same bytes
+/// and reports a page it cannot write the same way.
+fn nt_write_virtual_memory() -> Option<NtWrite> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static CALL: std::sync::OnceLock<Option<NtWrite>> = std::sync::OnceLock::new();
+    *CALL.get_or_init(|| {
+        // SAFETY: ntdll is always loaded; the symbol has this signature.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
+            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtWrite>(f))
+        }
+    })
+}
+
+type NtWrite = unsafe extern "system" fn(
+    process: isize,
+    base: *mut core::ffi::c_void,
+    buffer: *const core::ffi::c_void,
+    len: usize,
+    written: *mut usize,
+) -> i32;
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let nt = nt_write_virtual_memory();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        unsafe {
+            match nt {
+                // STATUS_SUCCESS only: a partial copy is a failure here too.
+                Some(call) => {
+                    call(GetCurrentProcess() as isize, at as _, from.cast(), n, &mut done) == 0
+                }
+                None => {
+                    WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done)
+                        != 0
+                }
+            }
+        }
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -2119,6 +2165,8 @@ struct Meter {
 
 impl Meter {
     fn new() -> Self {
+        #[cfg(feature = "diagnostics")]
+        crate::profile::start();
         let now = std::time::Instant::now();
         Meter {
             since: now,
@@ -3044,5 +3092,57 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 3).is_some(),
             "single-plane presentation after compositor initialization failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod title_memory_io {
+    use super::{copy_mapped, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+
+    /// Two committed pages followed by one reserved (not committed) page.
+    fn region() -> *mut u8 {
+        // SAFETY: a fresh reservation of ours, of which two pages are committed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let committed = VirtualAlloc(base, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!committed.is_null());
+            base.cast()
+        }
+    }
+
+    fn release(base: *mut u8) {
+        // SAFETY: the reservation made by `region`.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn write_mapped_writes_mapped_pages_and_skips_the_rest() {
+        let base = region();
+        let data = vec![0xabu8; 3 * PAGE];
+        // The third page is not committed: its piece is skipped, the others land.
+        write_mapped(base, data.as_ptr(), 3 * PAGE);
+        // SAFETY: the two committed pages of `region`.
+        let written = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
+        assert!(written.iter().all(|&b| b == 0xab));
+        release(base);
+    }
+
+    #[test]
+    fn copy_into_title_memory_that_is_not_all_mapped_is_left_alone() {
+        let base = region();
+        let from = vec![0x5au8; 3 * PAGE];
+        copy_mapped(base, from.as_ptr(), 3 * PAGE, true);
+        // A whole copy into mapped memory works without asking the system first.
+        copy_mapped(base, from.as_ptr(), 2 * PAGE, true);
+        // SAFETY: the two committed pages of `region`.
+        let now = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
+        assert!(now.iter().all(|&b| b == 0x5a));
+        release(base);
     }
 }
