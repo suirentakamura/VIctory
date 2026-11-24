@@ -79,18 +79,80 @@ pub(crate) fn new_submission() {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if on_wine() && j.asked_now.iter().any(|&(f, l)| f <= first && last <= l) {
-        j.asked += 1;
-        return Some((
-            j.asked,
-            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
-        ));
+    // Under Wine, only the pages no asking of this submission covered yet
+    // (copies of nested and overlapping buffers ask about parts of the
+    // same memory many times).
+    let gaps = if on_wine() {
+        uncovered(&j.asked_now, first, last)
+    } else {
+        vec![(first, last)]
+    };
+    let mut pages = Vec::new();
+    for (i, &(a, b)) in gaps.iter().enumerate() {
+        match ask(j, a, b) {
+            Some(found) => {
+                pages.extend(found);
+                if on_wine() && j.asked_now.len() < 4096 {
+                    j.asked_now.push((a, b));
+                }
+            }
+            // Not write-watched: view memory (all of it, as the first
+            // asking is of the whole range when none of it was asked).
+            None if !guarded => return None,
+            None if i == 0 && (a, b) == (first, last) => {
+                pages.extend(guard(first * PAGE, last * PAGE)?);
+            }
+            None => pages.extend(guard(a * PAGE, b * PAGE)?),
+        }
     }
+    j.asked += 1;
+    let now = j.asked;
+    for page in pages {
+        j.written.insert(page, now);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// The parts of pages `[first, last)` that no range of `asked` covers, in
+/// order.
+fn uncovered(asked: &[(usize, usize)], first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut over: Vec<(usize, usize)> = asked
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a < last && b > first)
+        .collect();
+    over.sort_unstable();
+    let (mut at, mut gaps) = (first, Vec::new());
+    for (a, b) in over {
+        if a > at {
+            gaps.push((at, a.min(last)));
+        }
+        at = at.max(b);
+        if at >= last {
+            break;
+        }
+    }
+    if at < last {
+        gaps.push((at, last));
+    }
+    gaps
+}
+
+/// Asks the kernel which 4 KiB pages of pages `[first, last)` were written
+/// (clearing their bits): the 64 KiB pages holding them. `None` if the
+/// memory is not write-watched.
+fn ask(j: &mut Journal, first: usize, last: usize) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -107,37 +169,30 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        if on_wine() && j.asked_now.len() < 4096 {
-            j.asked_now.push((first, last));
-        }
-        Vec::new()
-    };
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    if failed {
+        return None;
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(j.found[..count].iter().map(|&at| at / PAGE).collect())
+}
+
+#[cfg(test)]
+mod uncovered_tests {
+    use super::uncovered;
+
+    #[test]
+    fn only_the_pages_no_asking_covered() {
+        assert_eq!(uncovered(&[], 2, 8), vec![(2, 8)]);
+        assert_eq!(uncovered(&[(0, 10)], 2, 8), vec![]);
+        assert_eq!(uncovered(&[(3, 5)], 2, 8), vec![(2, 3), (5, 8)]);
+        assert_eq!(uncovered(&[(6, 9), (1, 4)], 2, 8), vec![(4, 6)]);
+        assert_eq!(uncovered(&[(4, 5), (4, 6), (9, 12)], 2, 8), vec![(2, 4), (6, 8)]);
+    }
 }
 
 /// Guarded blocks of view memory.
