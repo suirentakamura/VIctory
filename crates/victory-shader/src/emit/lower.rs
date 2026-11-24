@@ -2713,6 +2713,157 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        // Bytes and halves: the dword holding them, and their bit position
+        // in it. A half at byte 3 straddles into the next dword, as native
+        // RDNA2 reads it (an unaligned half on hardware with unaligned LDS
+        // access); bytes never do.
+        // `_d16` reads fill a register's low half (`_d16_hi` its high half)
+        // and keep the other; `_d16_hi` writes take the data's high half.
+        let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
+        let sub = match base {
+            "ds_read_u8" | "ds_read_i8" | "ds_write_b8" => Some(8u32),
+            "ds_read_u16" | "ds_read_i16" | "ds_write_b16" => Some(16),
+            _ => None,
+        };
+        let sub = sub.filter(|_| {
+            base == name
+                || name.ends_with("_d16") && base.starts_with("ds_read")
+                || name.ends_with("_d16_hi")
+        });
+        if let Some(bits) = sub {
+            let p = dword(self, offset);
+            let o = self.s.m.i32(offset);
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(c, Bin::And, at, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mask = self.s.m.i32((1u32 << bits) - 1);
+            // The next dword, for a half at byte 3, and whether it lies past
+            // the end of LDS (then the last dword stands in for the address,
+            // reads see 0 and writes drop the byte, as out-of-bounds LDS
+            // accesses do).
+            let next = if bits == 16 {
+                let two = self.s.m.i32(2);
+                let index = self.s.m.bin(c, Bin::LShr, at, two);
+                let one = self.s.m.i32(1);
+                let n = self.s.m.bin(c, Bin::Add, index, one);
+                let last = self.s.m.i32(self.s.lds_dwords - 1);
+                let past = self.s.m.cmp(c, pred::IUGT, n, last);
+                let n = self.s.m.select(c, past, last, n);
+                let lds = self.s.lds();
+                Some((self.s.m.element(c, lds, n), past))
+            } else {
+                None
+            };
+            let i64t = self.s.m.int(64);
+            if name.starts_with("ds_read") {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let w = self.s.m.load(c, p);
+                let x = match next {
+                    Some((q, past)) => {
+                        // Both dwords as one 64-bit value, shifted down.
+                        self.s.flags |= flags::INT64;
+                        let hi = self.s.m.load(c, q);
+                        let zero = self.s.m.i32(0);
+                        let hi = self.s.m.select(c, past, zero, hi);
+                        let lo = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+                        let k32 = self.s.m.int_const(i64t, 32);
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+                        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+                        let sh64 = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+                        let x = self.s.m.bin(c, Bin::LShr, both, sh64);
+                        self.s.m.cast(c, Cast::Trunc, x, self.s.t.i32)
+                    }
+                    None => self.s.m.bin(c, Bin::LShr, w, sh),
+                };
+                let x = if base.contains("_i") {
+                    let k = self.s.m.i32(32 - bits);
+                    let x = self.s.m.bin(c, Bin::Shl, x, k);
+                    self.s.m.bin(c, Bin::AShr, x, k)
+                } else {
+                    self.s.m.bin(c, Bin::And, x, mask)
+                };
+                let x = if base == name {
+                    x
+                } else {
+                    let old = match inst.read(Reg::V(reg)) {
+                        Some(v) => self.i32_of(v)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let half = self.s.m.i32(0xFFFF);
+                    let x = self.s.m.bin(c, Bin::And, x, half);
+                    let (x, keep) = if name.ends_with("_hi") {
+                        let k16 = self.s.m.i32(16);
+                        (self.s.m.bin(c, Bin::Shl, x, k16), half)
+                    } else {
+                        (x, self.s.m.i32(0xFFFF_0000))
+                    };
+                    let old = self.s.m.bin(c, Bin::And, old, keep);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+            } else {
+                // Clear, then set: two atomics, so lanes writing other
+                // bytes of the dword keep theirs.
+                let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                if name != base {
+                    // The data's high half.
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let x = self.s.m.bin(c, Bin::And, x, mask);
+                let ones = self.s.m.i32(u32::MAX);
+                // (dword, bits to clear, bits to set); a half at byte 3 also
+                // writes the next dword's low byte.
+                let mut parts = Vec::new();
+                match next {
+                    Some((q, past)) => {
+                        self.s.flags |= flags::INT64;
+                        let sh64 = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+                        let k32 = self.s.m.int_const(i64t, 32);
+                        let x64 = self.s.m.cast(c, Cast::ZExt, x, i64t);
+                        let x64 = self.s.m.bin(c, Bin::Shl, x64, sh64);
+                        let m64 = self.s.m.int_const(i64t, 0xFFFF);
+                        let m64 = self.s.m.bin(c, Bin::Shl, m64, sh64);
+                        for (ptr, shift) in [(p, false), (q, true)] {
+                            let (xv, mv) = if shift {
+                                (
+                                    self.s.m.bin(c, Bin::LShr, x64, k32),
+                                    self.s.m.bin(c, Bin::LShr, m64, k32),
+                                )
+                            } else {
+                                (x64, m64)
+                            };
+                            let mut xv = self.s.m.cast(c, Cast::Trunc, xv, self.s.t.i32);
+                            let mut mv = self.s.m.cast(c, Cast::Trunc, mv, self.s.t.i32);
+                            if shift {
+                                // Nothing to write past the end.
+                                let zero = self.s.m.i32(0);
+                                xv = self.s.m.select(c, past, zero, xv);
+                                mv = self.s.m.select(c, past, zero, mv);
+                            }
+                            let keep = self.s.m.bin(c, Bin::Xor, mv, ones);
+                            parts.push((ptr, keep, xv));
+                        }
+                    }
+                    None => {
+                        let x = self.s.m.bin(c, Bin::Shl, x, sh);
+                        let m = self.s.m.bin(c, Bin::Shl, mask, sh);
+                        let keep = self.s.m.bin(c, Bin::Xor, m, ones);
+                        parts.push((p, keep, x));
+                    }
+                }
+                use super::bitcode::Rmw;
+                let at = self.begin_guarded(guard);
+                for (ptr, keep, x) in parts {
+                    self.s.m.atomic(self.cur, Rmw::And, ptr, keep);
+                    self.s.m.atomic(self.cur, Rmw::Or, ptr, x);
+                }
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
