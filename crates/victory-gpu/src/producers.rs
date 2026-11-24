@@ -9,7 +9,7 @@
 //! a range again when work that runs writes it, and logs once per pair
 //! a reader that runs reading one of them, with the shader that was dropped.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 use crate::descriptor::View;
@@ -52,7 +52,9 @@ struct Write {
     frame: u64,
 }
 
-static WRITES: Mutex<Vec<Write>> = Mutex::new(Vec::new());
+const MAX_WRITES: usize = 8192;
+
+static WRITES: Mutex<VecDeque<Write>> = Mutex::new(VecDeque::new());
 static SEEN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
 thread_local! {
@@ -96,11 +98,11 @@ fn record(what: Target, writer: &str) {
     let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     // What the frame before last dropped is history: the title has moved on.
     writes.retain(|w| w.frame + 2 > frame);
-    if writes.len() >= 8192 {
-        writes.remove(0);
+    if writes.len() >= MAX_WRITES {
+        writes.pop_front();
     }
     if !writes.iter().any(|w| w.what == what && w.writer == writer) {
-        writes.push(Write {
+        writes.push_back(Write {
             what,
             writer: writer.to_owned(),
             frame,
@@ -130,11 +132,46 @@ pub(crate) fn live_write(view: &View) {
         return;
     }
     if let Some(what) = target_of(view) {
-        WRITES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|w| !w.what.overlaps(what));
+        clear_written(&mut WRITES.lock().unwrap_or_else(|e| e.into_inner()), what);
     }
+}
+
+fn clear_written(writes: &mut VecDeque<Write>, what: Target) {
+    // Process only the original entries so each fragment keeps its place in the history.
+    for _ in 0..writes.len() {
+        let mut write = writes.pop_front().unwrap();
+        if !write.what.overlaps(what) {
+            writes.push_back(write);
+            continue;
+        }
+        let (Target::Buffer(start, end), Target::Buffer(live_start, live_end)) = (write.what, what)
+        else {
+            continue;
+        };
+
+        let left = (start < live_start).then_some(Target::Buffer(start, live_start));
+        let right = (live_end < end).then_some(Target::Buffer(live_end, end));
+        match (left, right) {
+            (Some(what), Some(tail)) => {
+                let tail = Write {
+                    what: tail,
+                    writer: write.writer.clone(),
+                    frame: write.frame,
+                };
+                write.what = what;
+                writes.push_back(write);
+                writes.push_back(tail);
+            }
+            (Some(what), None) | (None, Some(what)) => {
+                write.what = what;
+                writes.push_back(write);
+            }
+            (None, None) => {}
+        }
+    }
+
+    let excess = writes.len().saturating_sub(MAX_WRITES);
+    writes.drain(..excess);
 }
 
 /// A draw that runs renders to title texture `resource`.
@@ -177,5 +214,68 @@ pub(crate) fn read(view: &View) {
                 "reads what only dropped work writes"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing(what: Target) -> Write {
+        Write {
+            what,
+            writer: "synthetic dispatch".to_owned(),
+            frame: 9,
+        }
+    }
+
+    #[test]
+    fn a_live_buffer_write_only_clears_its_own_range() {
+        let readers = [(8, 10), (30, 32), (48, 50)];
+        for (live_start, live_end, expected) in [
+            (0, 8, [true, true, true]),
+            (0, 24, [false, true, true]),
+            (24, 40, [true, false, true]),
+            (40, 80, [true, true, false]),
+            (8, 72, [false, false, false]),
+        ] {
+            let mut writes =
+                VecDeque::from([missing(Target::Buffer(8, 72)), missing(Target::Texture(1))]);
+            clear_written(&mut writes, Target::Buffer(live_start, live_end));
+            let actual = readers.map(|(start, end)| {
+                writes
+                    .iter()
+                    .any(|write| write.what.overlaps(Target::Buffer(start, end)))
+            });
+            assert_eq!(actual, expected, "live write {live_start}..{live_end}");
+            assert!(writes.iter().any(|write| write.what == Target::Texture(1)));
+            assert!(
+                writes
+                    .iter()
+                    .all(|write| write.writer == "synthetic dispatch" && write.frame == 9)
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_ranges_keeps_the_newest_frames_when_full() {
+        let mut writes: VecDeque<_> = (0..MAX_WRITES)
+            .map(|frame| Write {
+                frame: frame as u64,
+                ..missing(Target::Buffer(8, 72))
+            })
+            .collect();
+
+        clear_written(&mut writes, Target::Buffer(24, 40));
+
+        assert_eq!(writes.len(), MAX_WRITES);
+        assert_eq!(writes.front().unwrap().frame, (MAX_WRITES / 2) as u64);
+        assert!(writes[MAX_WRITES - 2].what == Target::Buffer(8, 24));
+        assert!(writes.back().unwrap().what == Target::Buffer(40, 72));
+        assert!(
+            writes
+                .iter()
+                .all(|write| write.frame >= (MAX_WRITES / 2) as u64)
+        );
     }
 }
