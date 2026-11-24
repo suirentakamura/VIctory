@@ -12,6 +12,12 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A rectangle list whose vertex shader reads no vertex buffer (it places
+//! the corners by vertex number, as the title's tiled lighting does) has
+//! nothing to expand. Its pipeline gets a geometry stage of ours instead
+//! (`pipeline::host`), which makes the fourth vertex from the vertex
+//! shader's outputs, and its draws keep the title's vertex counts.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both

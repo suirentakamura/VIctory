@@ -901,6 +901,11 @@ impl State {
         }
     }
 
+    /// Whether the bound pipeline completes rectangles in a geometry stage.
+    fn rect_gs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs)
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -1133,7 +1138,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        // A pipeline with a rectangle geometry stage takes the title's
+        // vertices as they are.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -1299,7 +1306,9 @@ impl State {
             why("indexed rectangles not supported");
             return false;
         }
-        if kind == DRAW && self.topology == RECTANGLES {
+        // Rectangles a geometry stage of ours completes run as they are;
+        // the others are expanded on the GPU.
+        if kind == DRAW && self.topology == RECTANGLES && !self.rect_gs() {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -1383,7 +1392,12 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+            // Rectangles run only where a geometry stage completes them:
+            // an indirect draw's vertex range is not known here to expand.
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || (kind == DRAW && self.rect_gs()))
+                    && self.prepare(list, kind == INDEXED)
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
