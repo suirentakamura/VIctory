@@ -2120,8 +2120,10 @@ impl<'a> Lower<'a> {
             let byte = self.s.m.bin(c, Bin::And, at, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let mask = self.s.m.i32((1u32 << bits) - 1);
-            // The next dword, for a half at byte 3 (the last dword stands in
-            // for one past the end).
+            // The next dword, for a half at byte 3, and whether it lies past
+            // the end of LDS (then the last dword stands in for the address,
+            // reads see 0 and writes drop the byte, as out-of-bounds LDS
+            // accesses do).
             let next = if bits == 16 {
                 let two = self.s.m.i32(2);
                 let index = self.s.m.bin(c, Bin::LShr, at, two);
@@ -2131,7 +2133,7 @@ impl<'a> Lower<'a> {
                 let past = self.s.m.cmp(c, pred::IUGT, n, last);
                 let n = self.s.m.select(c, past, last, n);
                 let lds = self.s.lds();
-                Some(self.s.m.element(c, lds, n))
+                Some((self.s.m.element(c, lds, n), past))
             } else {
                 None
             };
@@ -2140,10 +2142,12 @@ impl<'a> Lower<'a> {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
                 let x = match next {
-                    Some(q) => {
+                    Some((q, past)) => {
                         // Both dwords as one 64-bit value, shifted down.
                         self.s.flags |= flags::INT64;
                         let hi = self.s.m.load(c, q);
+                        let zero = self.s.m.i32(0);
+                        let hi = self.s.m.select(c, past, zero, hi);
                         let lo = self.s.m.cast(c, Cast::ZExt, w, i64t);
                         let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
                         let k32 = self.s.m.int_const(i64t, 32);
@@ -2196,7 +2200,7 @@ impl<'a> Lower<'a> {
                 // writes the next dword's low byte.
                 let mut parts = Vec::new();
                 match next {
-                    Some(q) => {
+                    Some((q, past)) => {
                         self.s.flags |= flags::INT64;
                         let sh64 = self.s.m.cast(c, Cast::ZExt, sh, i64t);
                         let k32 = self.s.m.int_const(i64t, 32);
@@ -2213,8 +2217,14 @@ impl<'a> Lower<'a> {
                             } else {
                                 (x64, m64)
                             };
-                            let xv = self.s.m.cast(c, Cast::Trunc, xv, self.s.t.i32);
-                            let mv = self.s.m.cast(c, Cast::Trunc, mv, self.s.t.i32);
+                            let mut xv = self.s.m.cast(c, Cast::Trunc, xv, self.s.t.i32);
+                            let mut mv = self.s.m.cast(c, Cast::Trunc, mv, self.s.t.i32);
+                            if shift {
+                                // Nothing to write past the end.
+                                let zero = self.s.m.i32(0);
+                                xv = self.s.m.select(c, past, zero, xv);
+                                mv = self.s.m.select(c, past, zero, mv);
+                            }
                             let keep = self.s.m.bin(c, Bin::Xor, mv, ones);
                             parts.push((ptr, keep, xv));
                         }
