@@ -17,10 +17,12 @@
 //!    `v3 = v0 + v2 - v1` for the formats and in-stride components that
 //!    [`crate::primitive::expand_rects`] computes.
 //!
-//! `ExecuteIndirect` then reads our arguments (with the title's count, if
-//! any) and the expanded vertices; transitions afterwards return the scratch
-//! buffers to unordered access, so the next indirect rectangle draw of the
-//! list reuses the whole scratch.
+//! `ExecuteIndirect` then reads only buffers of the list: our arguments, in
+//! which records at or past the title's count are empty draws (so it needs
+//! no count buffer, and no title buffer changes state), and the expanded
+//! vertices. Transitions afterwards return the scratch buffers to unordered
+//! access, so the next indirect rectangle draw of the list reuses the whole
+//! scratch.
 //!
 //! shortcut: the per-list vertex scratch has a fixed capacity of 8 MiB
 //! ([`RECT_SCRATCH_BYTES`]), shared by the records of one draw; records whose
@@ -562,13 +564,12 @@ pub(crate) struct Prepared {
     pub(crate) args_buf: ID3D12Resource,
     vert_buf: Option<ID3D12Resource>,
     views: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>,
-    counter: Option<ID3D12Resource>,
 }
 
 impl Prepared {
-    /// Transitions the rewritten arguments, expanded vertex scratch and
-    /// optional count buffer for `ExecuteIndirect`, and binds the expanded
-    /// per-vertex buffer views (overriding the title's slots after `prepare`).
+    /// Transitions the rewritten arguments and expanded vertex scratch for
+    /// `ExecuteIndirect`, and binds the expanded per-vertex buffer views
+    /// (overriding the title's slots after `prepare`).
     pub(crate) fn before_draw(&self, list: &HostList) {
         let mut barriers = Vec::with_capacity(3);
         barriers.push(transition(
@@ -583,14 +584,7 @@ impl Prepared {
                 D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
             ));
         }
-        if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ));
-        }
-        // SAFETY: an open list and live buffers owned by the list or shadows.
+        // SAFETY: an open list and live buffers the list owns.
         unsafe {
             list.list.ResourceBarrier(&barriers);
             for &(slot, view) in &self.views {
@@ -599,8 +593,8 @@ impl Prepared {
         }
     }
 
-    /// Restores the scratch buffers and optional count buffer to unordered
-    /// access so subsequent passes and draws can reuse them.
+    /// Returns the scratch buffers to unordered access, so later passes and
+    /// draws of the list can reuse them.
     pub(crate) fn after_draw(&self, list: &HostList) {
         let mut barriers = Vec::with_capacity(3);
         barriers.push(transition(
@@ -615,14 +609,7 @@ impl Prepared {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             ));
         }
-        if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ));
-        }
-        // SAFETY: an open list and live buffers owned by the list or shadows.
+        // SAFETY: an open list and live buffers the list owns.
         unsafe { list.list.ResourceBarrier(&barriers) };
     }
 }
@@ -641,7 +628,8 @@ struct SlotWork {
 /// recorded onto the host list; on `Ok(prepared)` the compute pipeline and root
 /// signature were replaced and the caller binds its graphics state, calls
 /// [`Prepared::before_draw`], executes indirect with stride 16 on
-/// `prepared.args_buf`, and calls [`Prepared::after_draw`].
+/// `prepared.args_buf` without a count buffer, and calls
+/// [`Prepared::after_draw`].
 pub(crate) fn expand(
     list: &HostList,
     pipeline: &HostPipeline,
@@ -825,7 +813,6 @@ pub(crate) fn expand(
         args_buf: dst_args_buf,
         vert_buf,
         views,
-        counter: counter.map(|(c, _)| c.buffer.clone()),
     })
 }
 

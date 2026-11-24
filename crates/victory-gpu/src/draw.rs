@@ -1054,15 +1054,16 @@ impl State {
                 )
             });
             // SAFETY: an open list with everything set; `prepared.args_buf` is
-            // list-owned, `counter` is kept alive by refresh, signature cached.
+            // list-owned (records past the title's count are empty draws, so
+            // no count buffer), the signature cached.
             unsafe {
                 list.list.ExecuteIndirect(
                     &signature,
                     max,
                     &prepared.args_buf,
                     0,
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    None::<&ID3D12Resource>,
+                    0,
                 )
             };
             prepared.after_draw(list);
