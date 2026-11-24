@@ -1426,3 +1426,39 @@ fn s_lshl_add_sets_scc_on_unsigned_overflow() {
     );
 }
 
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 offen` (a load).
+const fn buffer_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32) << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
+fn buffer_byte_and_short_loads_extend_as_the_console() {
+    const UBYTE: u8 = 0x08;
+    const SBYTE: u8 = 0x09;
+    const USHORT: u8 = 0x0A;
+    const SSHORT: u8 = 0x0B;
+    // Dword 0 of the buffer holds s0 (the harness's UAV is one dword); each
+    // load reads at byte s1, before the result goes to dword 0.
+    let loads: [(u8, fn(u32, u32) -> u32); 4] = [
+        (UBYTE, |w, at| w >> (8 * at) & 0xFF),
+        (SBYTE, |w, at| (w >> (8 * at)) as u8 as i8 as i32 as u32),
+        (USHORT, |w, at| w >> (8 * at) & 0xFFFF),
+        (SSHORT, |w, at| (w >> (8 * at)) as u16 as i16 as i32 as u32),
+    ];
+    for (op, want) in loads {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(buffer_load_offen(op, 0, 2, 8));
+        let shader = build_valu_cs(&body);
+        let mut cases = Vec::new();
+        for w in [0x8081_7F42, 0x1234_F00D] {
+            let ats: &[u32] = if matches!(op, USHORT | SSHORT) { &[0, 2] } else { &[0, 1, 2, 3] };
+            cases.extend(ats.iter().map(|&at| [w, at, 0, 0]));
+        }
+        run_cases(&shader, &cases, |backend, _, [w, at, ..], got| {
+            assert_eq!(got, want(w, at), "{backend}: op {op:#x} of {w:#010x} at byte {at}");
+        });
+    }
+}

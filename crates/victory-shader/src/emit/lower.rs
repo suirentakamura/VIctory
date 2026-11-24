@@ -7476,12 +7476,22 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        // A byte or short load: the dword holding it, the field cut out
+        // (width, signed).
+        let sub = match plain.strip_prefix("buffer_load_") {
+            Some("ubyte") => Some((8, false)),
+            Some("sbyte") => Some((8, true)),
+            Some("ushort") => Some((16, false)),
+            Some("sshort") => Some((16, true)),
+            _ => None,
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7526,6 +7536,29 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        // shortcut: as for global loads, a byte or short field is taken not
+        // to cross a dword: the dword is read at the offset rounded down,
+        // and the field shifted out of it.
+        let narrow = match sub {
+            Some((width, signed)) => {
+                let (three, not3) = (self.s.m.i32(3), self.s.m.i32(!3));
+                let byte = self.s.m.bin(c, Bin::And, off, three);
+                let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+                off = self.s.m.bin(c, Bin::And, off, not3);
+                Some((shift, width, signed))
+            }
+            None => None,
+        };
+        let cut = |l: &mut Self, x: V| -> V {
+            let Some((shift, width, signed)) = narrow else {
+                return x;
+            };
+            let x = l.s.m.bin(c, Bin::LShr, x, shift);
+            let left = l.s.m.i32(32 - width);
+            let x = l.s.m.bin(c, Bin::Shl, x, left);
+            l.s.m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
+        };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
@@ -7546,6 +7579,7 @@ impl<'a> Lower<'a> {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
                 let x = self.cbuffer_dword(h, a);
+                let x = cut(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -7780,6 +7814,7 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = cut(self, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
