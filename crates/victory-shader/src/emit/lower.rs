@@ -6973,8 +6973,10 @@ impl<'a> Lower<'a> {
             0
         };
         let spatial = coords - usize::from(kind == 6 || kind == 7);
+        // A cube's gradients are of its face coordinates (s, t).
+        let grad_dims = if kind == 5 { 2 } else { spatial };
         let grads = if name.starts_with("image_sample_d") {
-            2 * spatial
+            2 * grad_dims
         } else {
             0
         };
@@ -7208,7 +7210,7 @@ impl<'a> Lower<'a> {
             let offset_word = name.ends_with("_o");
             // The extra words and gradients, as laid out above.
             let first = extras;
-            debug_assert_eq!(grads, if op == 63 { 2 * spatial } else { 0 });
+            debug_assert_eq!(grads, if op == 63 { 2 * grad_dims } else { 0 });
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -7223,9 +7225,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            // A cube's face coordinates and face, before they become a
+            // direction.
+            let face = [cs[0], cs[1], cs[2]];
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -7338,11 +7343,25 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..grad_dims {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + grad_dims + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        // The direction is affine in the face coordinates
+                        // on a face (see `cube_direction`): a step of the
+                        // face coordinates moves it by the difference.
+                        let [s0, t0, f] = face;
+                        for d in [0, 3] {
+                            let s1 = self.s.m.bin(c, Bin::Add, s0, g[d]);
+                            let t1 = self.s.m.bin(c, Bin::Add, t0, g[d + 1]);
+                            let moved = self.cube_direction(s1, t1, f);
+                            for k in 0..3 {
+                                g[d + k] = self.s.m.bin(c, Bin::Sub, moved[k], cs[k]);
+                            }
+                        }
                     }
                     args.extend(&os);
                     args.extend(g);

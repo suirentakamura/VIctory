@@ -301,3 +301,15 @@ fn a_gradient_sample_with_a_clamp_reads_the_coordinates_after_the_gradients() {
         assert_eq!(got, 21.0, "{backend}: texel (1, 2)");
     }
 }
+
+#[test]
+fn a_cube_gradient_sample_takes_face_coordinate_gradients() {
+    // image_sample_d_cl v0, v[3:10] dim:CUBE: d(s, t)/dx, d(s, t)/dy, then
+    // s, t, face, clamp (8 addresses, as the title's cube samples).
+    let mut sample = mimg(IMAGE_SAMPLE_D_CL, 0, 3, false);
+    sample[0] = sample[0] & !(7 << 3) | 3 << 3; // dim: cube
+    let setup: Vec<(u8, u32)> = (3..=10).map(|v| (v, 0)).collect();
+    // The lowering takes 8 addresses (a cube's gradients were taken as 3D,
+    // 10 addresses, before) and the DXIL validates where dxil.dll is.
+    build(&setup, sample);
+}
