@@ -3,7 +3,8 @@
 //! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! made from the other three on the CPU for direct draws and on the GPU for
+//! indirect draws ([`crate::rectangles`]).
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -43,8 +44,8 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
     }
 }
 
-#[derive(Clone, Copy)]
-enum Kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
     F32,
     F16,
     Unorm8,
@@ -52,7 +53,7 @@ enum Kind {
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-fn components(format: u32) -> Option<(usize, Kind)> {
+pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -69,11 +70,21 @@ fn components(format: u32) -> Option<(usize, Kind)> {
 }
 
 impl Kind {
-    fn bytes(self) -> usize {
+    pub(crate) fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
             Kind::F16 | Kind::Unorm16 => 2,
             Kind::Unorm8 => 1,
+        }
+    }
+
+    /// Numeric code shared with [`crate::rectangles`]'s HLSL shader.
+    pub(crate) fn code(self) -> u32 {
+        match self {
+            Kind::F32 => 0,
+            Kind::F16 => 1,
+            Kind::Unorm16 => 2,
+            Kind::Unorm8 => 3,
         }
     }
 

@@ -301,6 +301,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
+    /// expanded vertices, rewritten draw arguments and per-draw atomic
+    /// counters, reused across draws and across resets.
+    rect_scratch: Mutex<RectScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -366,6 +370,29 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Per-list GPU-writable buffers for indirect rectangle expansion
+/// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
+/// its VB -> UAV barrier), one rewritten-arguments buffer (grown if a draw
+/// has more records), and chunks of 4-byte atomic counters zeroed before
+/// submission.
+#[derive(Default)]
+struct RectScratch {
+    vertices: Option<ID3D12Resource>,
+    args: Option<(ID3D12Resource, u64)>,
+    counters: Vec<(ID3D12Resource, usize, u64)>,
+    counter_chunk: usize,
+    counter_used: u32,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the counter pointers are
+// persistent mappings written only before submission.
+unsafe impl Send for RectScratch {}
+
+/// Counters per chunk (4 KiB = 1024 words).
+const RECT_COUNTER_CHUNK: u32 = 1024;
+/// Initial rewritten-arguments buffer size (64 KiB = 4096 draw records).
+const RECT_ARGS_MIN: u64 = 64 << 10;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -481,6 +508,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                rect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -889,6 +917,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (rect.counter_chunk, rect.counter_used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1128,6 +1160,69 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's GPU-writable scratch buffer for expanded indirect
+    /// rectangle vertices (`capacity` bytes), created on first use.
+    pub(crate) fn rect_vertices(&self, capacity: u64) -> Option<ID3D12Resource> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.vertices.is_none() {
+            let buffer = host()?.default_buffer(capacity)?;
+            name(&buffer, || format!("rect scratch {capacity:#x}"));
+            rect.vertices = Some(buffer);
+        }
+        rect.vertices.clone()
+    }
+
+    /// A GPU-writable buffer of at least `bytes` for rewritten indirect
+    /// draw arguments, kept alive until the list is reset.
+    pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, len)) = &rect.args
+            && *len >= want
+        {
+            return Some(buf.clone());
+        }
+        let buffer = host()?.default_buffer(want)?;
+        name(&buffer, || format!("rect args {want:#x}"));
+        let old = rect.args.replace((buffer.clone(), want));
+        drop(rect);
+        if let Some((old, _)) = old {
+            self.keep(&old);
+        }
+        Some(buffer)
+    }
+
+    /// The host GPU address of a 4-byte atomic counter for one indirect
+    /// rectangle draw, zeroed at each submission before the list runs.
+    pub(crate) fn rect_counter(&self) -> Option<u64> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.counter_used == RECT_COUNTER_CHUNK {
+            rect.counter_chunk += 1;
+            rect.counter_used = 0;
+        }
+        if rect.counter_chunk == rect.counters.len() {
+            let bytes = u64::from(RECT_COUNTER_CHUNK) * 4;
+            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            name(&buffer, || "rect counters".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            rect.counters.push((buffer, data as usize, gpu));
+            rect.counter_used = 0;
+        }
+        let (_, data, gpu) = rect.counters[rect.counter_chunk];
+        let slot = rect.counter_used;
+        rect.counter_used += 1;
+        drop(rect);
+        if slot == 0 {
+            let bytes = RECT_COUNTER_CHUNK as usize * 4;
+            // SAFETY: the list's own mapped chunk, zeroed before it runs.
+            self.defer_host(move || unsafe {
+                std::ptr::write_bytes(data as *mut u8, 0, bytes);
+            });
+        }
+        Some(gpu + u64::from(slot) * 4)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1809,6 +1904,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A GPU-only default-heap buffer that shaders can write (unordered
+    /// access). Starts in the common state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a default-heap buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
                 None
             }
         }
