@@ -52,7 +52,9 @@ row or group, so it is unchanged in the split form.
 
 Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
 the host has no 64-lane waves and the program:
-- reads other lanes only through DPP and `ds_swizzle`;
+- reads other lanes only through DPP and `ds_swizzle`, and has no
+  `v_readfirstlane` (the console wave's first lane is not in the upper
+  half; such programs take the console flow);
 - reads no mask whole and tests no bit of a mask held as a number;
 - has no whole-wave sections (their reductions would cover a half);
 - uses no LDS (the console compiler may have left out barriers between
@@ -60,8 +62,9 @@ the host has no 64-lane waves and the program:
 
 Anything else still stops with the step 1 reason. `mask_dword`, the wave
 reduction lowering and `lane_bit` refuse the split form as a safety net.
-`v_readfirstlane` reads the first active lane of the host wave, as it
-already did for every wave64 program without a declared wave size.
+(A wave64 program that declares no wave size at all still runs in whatever
+waves the host forms, as on `main`: its `v_readfirstlane` reads the host
+wave's first lane.)
 
 **What crosses halves** goes through an exchange in groupshared memory:
 

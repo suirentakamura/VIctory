@@ -341,3 +341,17 @@ fn dpp_row_masks_name_console_rows() {
         |t| if t < 32 { t } else { 1 },
     );
 }
+
+/// `v_readfirstlane` reads the console wave's first lane: lane 0 here, in
+/// the upper half too. With DPP in the program it used to be split in
+/// halves, where the upper half read its own first lane (32).
+#[test]
+fn first_lane_reads_are_the_console_waves() {
+    let body = [
+        0x7E06_02FA,
+        0xFF00_E400, // v_mov_b32_dpp v3, v0 quad_perm:[0,1,2,3]
+        0x7E12_0500, // v_readfirstlane_b32 s9, v0
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+}

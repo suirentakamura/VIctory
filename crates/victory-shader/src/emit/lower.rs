@@ -436,9 +436,13 @@ impl<'a> Lower<'a> {
             // row. Not with LDS (the console compiler may leave out barriers
             // between the halves) nor whole-wave sections (their reductions
             // become wave operations over the host's wave).
+            // (`v_readfirstlane` reads the console wave's first lane, which
+            // the upper half does not hold: such programs take the console
+            // flow below.)
             split = console_lanes
                 && x.native.wave64
                 && !reads_whole
+                && !insts().any(|i| i.name() == "v_readfirstlane_b32")
                 && !masks_held
                 && s.lds_dwords == 0
                 && !x.target.runs(64)
