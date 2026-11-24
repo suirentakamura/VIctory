@@ -596,6 +596,23 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    if !pages.is_null() {
+        // SAFETY: the title passes `n` page numbers.
+        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+        // Already shown there: under Wine mapping it again costs wineserver
+        // requests that walk every view (see `map_alias`).
+        let shown = pages.iter().enumerate().all(|(i, page)| {
+            match (physical.pages.get(page), source(&physical, base + i * PAGE)) {
+                (Some(want), Some(have)) => {
+                    Arc::ptr_eq(&want.section, &have.section) && want.index == have.index
+                }
+                _ => false,
+            }
+        });
+        if shown && n != 0 {
+            return address;
+        }
+    }
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -803,7 +820,25 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     physical.views.insert(base, (len, slice));
+    view_churn(true, physical.views.len());
     true
+}
+
+/// Views mapped and unmapped, logged every 5 s (each is a wineserver
+/// request walking every view under Wine).
+fn view_churn(mapped: bool, views: usize) {
+    use std::sync::atomic::AtomicU64;
+    static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    COUNTS[usize::from(!mapped)].fetch_add(1, Ordering::Relaxed);
+    let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = since.get_or_insert_with(std::time::Instant::now);
+    if at.elapsed().as_secs() >= 5 {
+        let secs = at.elapsed().as_secs_f64();
+        *at = std::time::Instant::now();
+        let [m, u] = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / secs);
+        tracing::info!("views: {m:.0} mapped/s, {u:.0} unmapped/s, {views} mapped");
+    }
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -881,6 +916,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        view_churn(false, physical.views.len());
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
