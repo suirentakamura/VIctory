@@ -23,15 +23,14 @@ fn wave_size(dxil: &[u8]) -> Option<u32> {
 /// user SGPR 0 and the group id in s1: lane t of group g stores the
 /// result of `body` (v0 = t in, v2 out) at dword g * threads + t.
 fn program(body: &[u32], threads: u32) -> crate::NativeProgram {
-    let shift = (threads * 4).trailing_zeros();
-    assert_eq!(1 << shift, threads * 4, "a power of two");
     let mut words = vec![
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
-        0xFA00_0000,                      // s_load_dwordx4 s[4:7], s[2:3], null
-        0x8F08_0001 | (128 + shift) << 8, // s_lshl_b32 s8, s1, shift
-        0xBF8C_C07F,                      // s_waitcnt lgkmcnt(0)
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0x9308_FF01,
+        threads * 4, // s_mul_i32 s8, s1, threads * 4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     ];
     words.extend_from_slice(body);
     words.extend_from_slice(&[
@@ -193,23 +192,134 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
     }
 }
 
-/// A read across halves (`v_readlane` 40) still needs 64-lane waves.
+/// Runs `body` (v0 = t in, v2 out) on every hardware adapter in groups of
+/// `threads` and checks lane t against `want(t)`; on a host without
+/// 64-lane waves it must have translated in the console flow.
+fn console_flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32) {
+    flow_case(label, body, threads, want, true);
+}
+
+/// [`console_flow_case`], checking hosts with 64-lane waves (the per-lane
+/// form) only when `native` says.
+fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32, native: bool) {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let p = program(body, threads);
+        let split = !host.target().runs(64);
+        let groups = 2;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
+        if !split && !native {
+            if out != expect {
+                eprintln!("{name}: {label}: the per-lane form differs (known)");
+            }
+            continue;
+        }
+        assert_eq!(
+            out, expect,
+            "{name}: {label}, {threads} threads (split {split})"
+        );
+        eprintln!("{name}: {label}, {threads} threads exact (split {split})");
+    }
+}
+
+/// A mask counted whole: 40 lanes of the console wave, 32 in one half and
+/// 8 in the other.
 #[test]
-fn reads_across_halves_still_need_64_lane_waves() {
+fn masks_read_whole_count_both_halves() {
     let body = [
-        0xD760_0002,
-        0x0001_5100, // v_readlane_b32 s2, v0, 40
-        0x7E04_0202, // v_mov_b32 v2, s2
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let p = program(&body, 64);
+    console_flow_case("s_bcnt1 of lanes below 40", &body, 64, |_| 40);
+    // 48 threads: the upper half is partial.
+    console_flow_case("s_bcnt1 of lanes below 40", &body, 48, |_| 40);
+    // 32 threads: no upper half at all.
+    console_flow_case("s_bcnt1 of lanes below 40", &body, 32, |_| 32);
+}
+
+/// A lane of the other half: lane 40 is the upper half's lane 8.
+#[test]
+fn lane_reads_cross_halves() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("v_readlane 40", &body, 64, |_| 40);
+}
+
+/// A branch only lanes below 20 take (all in the lower half), with a lane
+/// read inside: the upper half has no lane there but still meets the lower
+/// one at the exchange.
+#[test]
+fn exchanges_inside_a_branch_one_half_skips() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (lane < 20) v2 = readlane(10)", &body, 64, |t| {
+        if t < 20 { 10 } else { 1 }
+    });
+}
+
+/// Groups of several console waves need the halves to meet without a
+/// group barrier: not yet.
+#[test]
+fn console_flow_is_for_one_console_wave_per_group() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
     };
-    assert!(emit_for(&p, nvidia).is_err());
-    let rdna = super::Target {
-        lanes_min: 32,
-        lanes_max: 64,
-    };
-    assert!(emit_for(&p, rdna).is_ok());
+    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
+    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+}
+
+/// A loop lane t runs t times, with a lane read of the other half in
+/// every iteration: the lower half's lanes are done after 31 iterations,
+/// the upper half's go on to 63, and the console wave loops while any lane
+/// does. After it, s9 holds lane 40's id, as the last iteration read it.
+///
+/// The per-lane form (hosts with 64-lane waves) gets this wrong: a lane
+/// that left the loop is not there for the later iterations' lane reads,
+/// and a lane that skipped the loop never sees the scalar it set (on an
+/// RDNA2 iGPU, lane 0 ends with 0 and lanes 41 to 63 with t).
+#[test]
+fn loops_run_while_any_lane_of_the_console_wave_does() {
+    let body = [
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz end
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        // end:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
 }

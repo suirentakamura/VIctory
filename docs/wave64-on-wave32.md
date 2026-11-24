@@ -1,7 +1,10 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2 and 4 are in. Programs whose lanes read only their own
-half run on NVIDIA; the rest still need 64-lane waves.
+Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
+read only their own half run as two 32-lane waves. Groups of one console
+wave also run in the console flow: masks read whole, lanes of the other
+half, divergent branches and loops. Still open: groups of several console
+waves, LDS, whole-wave sections and `ds_(b)permute`.
 
 ## The problem
 
@@ -73,33 +76,61 @@ already did for every wave64 program without a declared wave size.
 A mask read only lane by lane (a `v_cndmask` selector, a carry-in) needs
 just the lane's own half. Exchanging those anyway is correct but slow.
 
-## Synchronisation: the hard part
+## Synchronisation: the console flow
 
 Both halves must reach every exchange together. On the console they do,
-because a wave runs every instruction whatever EXEC holds. Our
+because a wave runs every instruction whatever EXEC holds. Our per-lane
 structurisation turns EXEC into per-lane branches, so a half with no lane
-on a path skips that path and never reaches an exchange there. Bathyal can
-rely on uniform control flow per console wave (its recompiler runs every
-lane through every instruction). We cannot, and need:
+on a path would skip that path and never reach an exchange there.
 
-- **Uniform regions.** A region that contains an exchange (directly or in
-  a nested region) is entered by both halves whenever either half has a lane
-  for it. The branch into it is the console-wave OR of the lanes' conditions,
-  which is itself an exchange, taken where both halves still are. Inside,
-  the lanes' own conditions become guards (the existing guard machinery). A
-  loop containing an exchange runs while any lane of the console wave
-  continues.
-- **The exchange itself.** For a group of one console wave (64 threads or
-  fewer), use a slot per half and `GroupMemoryBarrierWithGroupSync`. That is
-  legal because both halves are in the same uniform region, so every thread
-  of the group reaches it. For groups of several console waves, a group
-  barrier would also wait for other console waves, which may be elsewhere.
-  Pairs meet instead through per-console-wave arrival counters, with
-  double-buffered slots and a bounded wait that gives up rather than hanging
-  the GPU.
-- **One wave sharing LDS** needs barriers where the console relied on
-  in-order execution. These are allowed only in uniform regions, so this
-  comes after them.
+An earlier version of this plan made only the regions with an exchange
+uniform. It turned out cleaner to run the whole program as the console
+does (step 5, `lower::CONSOLE_FLOW`):
+
+- `structure::structure_console` builds the per-lane booleans without
+  resolving mask joins from what arriving lanes know, since every lane
+  arrives. Each join that differs between edges becomes a phi.
+  `Structured::execs` gives the lane's EXEC bit at each vector
+  instruction.
+- The lowering guards every vector instruction with that EXEC bit.
+  `v_readlane`, `v_writelane` and `v_readfirstlane` ignore EXEC, as on the
+  console.
+- Branches are the console's `s_cbranch_*`. EXEC and VCC tests, and the
+  SCC of a mask operation, ask whether some lane of the console wave has
+  the bit: each half's ballot, exchanged. Both halves then take every
+  branch the same way, and loops run while any lane of the console wave
+  does.
+- Exchange (`Lower::exchange`): each half stores its dword to group-shared
+  slot `half`, then a group barrier, both read both slots, and a second
+  barrier. Every thread of the group reaches it because the group is one
+  console wave whose halves take the same branches. A group of 32 threads
+  or fewer has no upper half: its word is 0 and no barrier is needed.
+- Masks read whole (`mask_dword`) are the exchanged ballots. Lane bits of
+  masks held as numbers use the console lane. `v_readlane` and
+  `v_readfirstlane` read the owning half's value. `v_writelane` and
+  `v_mbcnt` count with the console lane.
+
+`lower` tries the per-lane form first. A program that needs the console
+flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
+console structure. Eligible: wave64 compute on a host without 64-lane
+waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
+whole-wave sections.
+
+Groups of several console waves still need another meeting point: a group
+barrier would wait for console waves elsewhere. The plan stays per-console-
+wave arrival counters with double-buffered slots and a bounded wait.
+
+### A finding about the per-lane form
+
+`split_tests::loops_run_while_any_lane_of_the_console_wave_does` (a loop
+lane t runs t times, reading lane 40 in each iteration) is exact in the
+console flow on an RTX 5070. On a Radeon iGPU, the per-lane form (which
+hosts with 64-lane waves get) is wrong: lane 0 ends with 0 instead of 40,
+and lanes 41 to 63 with t instead of t + 40. A lane that has left the
+loop is not there when later iterations read it, and a lane that skipped
+the loop never sees the scalar the loop set. On the console, `v_readlane`
+reads lane 40 whatever EXEC holds. So the console flow may be the better
+form for such programs on AMD too. Not changed there yet.
 
 ## Testing
 
@@ -127,7 +158,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    all stay inside a half, with no mask read whole.~~ No new lane assignment
    was needed (see above). A later widening is LDS in multi-wave groups,
    whose waves already meet at barriers.
-5. Uniform regions and the one-wave exchange (ballots, readlane, mbcnt).
+5. ~~The console flow and the one-wave exchange (ballots, readlane,
+   readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. Multi-wave groups (counters), then one-wave LDS sharing.
 
 ## Credit
