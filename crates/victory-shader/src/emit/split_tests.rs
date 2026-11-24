@@ -561,3 +561,101 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
     ];
     console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
 }
+
+/// A scan of the lane ids with `opcode` (a VOP2 operation) as its step and
+/// `ident` (an inline constant operand) in the lanes outside the mask, as
+/// in the test above, then a read of lane 63: the reduction over the whole
+/// console wave, left in s10. It uses v1 to v3 as scratch in every lane.
+fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
+    let op = opcode << 25;
+    vec![
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0000 | ident, // v_cndmask_b32 v1, ident, v0, s[0:1]
+        op | 0x0002_02FA,
+        0xFF01_1101, // v_<op> v1, v1, v1 row_shr:1
+        op | 0x0002_02FA,
+        0xFF01_1201, // row_shr:2
+        op | 0x0002_02FA,
+        0xFF01_1401, // row_shr:4
+        op | 0x0002_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301,         // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0200 | ident, // v_mov_b32 v3, ident
+        0x7E06_02FA,
+        0xAF00_E402,      // v_mov_b32 v3, v2 row_mask:0xa
+        op | 0x0002_0701, // v_<op> v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01,      // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380,      // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1,      // s_mov_b32 exec_hi, -1
+        op | 0x0002_0209, // v_<op> v1, s9, v1
+        0xD760_000A,
+        0x0001_7F01, // v_readlane_b32 s10, v1, 63
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]
+}
+
+/// Reductions over the whole console wave need both halves: the sum of the
+/// lane ids, their maximum (lane 63, in the upper half), their minimum
+/// (lane 0, in the lower half) and their bitwise or.
+#[test]
+fn whole_wave_reductions_join_both_host_waves() {
+    // (operation, VOP2 opcode, identity operand, the console's result)
+    for (label, opcode, ident, want) in [
+        ("v_add_nc_u32", 37, 0x80, 2016),
+        ("v_max_u32", 20, 0x80, 63),
+        ("v_min_u32", 19, 0xC1, 0),
+        ("v_or_b32", 28, 0x80, 63),
+    ] {
+        let mut body = reduction_scan(opcode, ident);
+        body.push(0x7E04_020A); // v_mov_b32 v2, s10
+        console_flow_case(&format!("whole-wave {label}"), &body, 64, |_| want);
+    }
+}
+
+/// The same sum over a mask that straddles the halves: lanes below 40 (32
+/// in the lower half, 8 in the upper). The other lanes keep their value.
+#[test]
+fn masked_whole_wave_sum_straddles_the_halves() {
+    // The result goes through v5: the scan leaves no old value in v2.
+    let mut body = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    body.extend(reduction_scan(37, 0x80));
+    body.extend([
+        0x7E0A_020A, // v_mov_b32 v5, s10
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x7E04_0305, // v_mov_b32 v2, v5
+    ]);
+    // 0 + 1 + ... + 39 = 780.
+    console_flow_case("masked whole-wave sum", &body, 64, |t| {
+        if t < 40 { 780 } else { 1 }
+    });
+}
+
+/// A whole-wave section crosses the halves only in a group of exactly one
+/// console wave: with a partial upper half, or none, it still stops.
+#[test]
+fn whole_wave_sections_in_partial_groups_still_stop() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let mut body = reduction_scan(37, 0x80);
+    body.push(0x7E04_020A); // v_mov_b32 v2, s10
+    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
+    for threads in [48, 32] {
+        assert_eq!(
+            emit_for(&program(&body, threads), nvidia),
+            Err(crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "a whole-wave section of a wave64 on a host without 64-lane waves",
+            }),
+            "{threads} threads"
+        );
+    }
+}
