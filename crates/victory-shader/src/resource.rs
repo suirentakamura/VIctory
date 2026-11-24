@@ -330,6 +330,12 @@ struct Sum {
     dynamic: Option<Value>,
 }
 
+/// Descriptor dwords a lane computed (not loaded or copied).
+const COMPUTED: &str = "a descriptor read from the first lane of computed VGPRs";
+/// Descriptor dwords a lane loaded with several loads: numbers, not a
+/// descriptor stored in memory (one load reads that).
+const GATHERED: &str = "a descriptor read from the first lane of several loads";
+
 struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
@@ -1392,13 +1398,14 @@ impl<'a> Tracer<'a> {
             Some(n) if n.starts_with("ds_read") => {
                 "a descriptor read from the first lane of an LDS read"
             }
-            Some(n) if n.starts_with("buffer_load") => {
+            Some(n) if n.starts_with("buffer_load") && self.one_def(words) => {
                 "a descriptor read from the first lane of a buffer load"
             }
+            Some(n) if n.starts_with("buffer_load") => GATHERED,
             Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => {
                 "a descriptor read from the first lane of a partial or mixed load"
             }
-            Some(_) => "a descriptor read from the first lane of computed VGPRs",
+            Some(_) => COMPUTED,
         })
     }
 
@@ -1553,6 +1560,26 @@ impl<'a> Tracer<'a> {
     /// Lanes take their own paths ([`Structured`]), so each gets the value
     /// of the edge it came by; an edge they cannot take is `None` (a flow
     /// block's phi joins an arm's dwords with what lanes that skipped the
+    /// Whether block `q` ends with an `s_cbranch_execz` to `join`: the edge
+    /// of the lanes that skip the code between.
+    fn skips_to(&self, q: usize, join: usize) -> bool {
+        self.p.blocks[q]
+            .insts
+            .last()
+            .is_some_and(|i| i.name() == "s_cbranch_execz")
+            && matches!(self.p.blocks[q].exit, Exit::Branch { taken, .. } if taken == join)
+    }
+
+    /// Whether the varying `words` all come from one instruction.
+    fn one_def(&self, words: &[Term]) -> bool {
+        let mut defs = words.iter().filter_map(|w| match *w {
+            Term::Value(v) if self.varies(*w) => Some(self.defs[v.0 as usize]),
+            _ => None,
+        });
+        let Some(first) = defs.next() else { return true };
+        defs.all(|d| d == first)
+    }
+
     /// arm held before, which only they read).
     fn lane_phi(
         &self,
@@ -1626,6 +1653,15 @@ impl<'a> Tracer<'a> {
             known.truncate(n);
             match arg {
                 Ok(a) => args.push(a),
+                // Lanes that skipped the code writing the descriptor (the
+                // edge of an `s_cbranch_execz` over it: an `if` without
+                // `else` around the console compiler's descriptor copy) keep
+                // the numbers the registers held, computed or gathered from
+                // several loads: on the console they access with a garbage
+                // descriptor, whose result the program does not use. Taken
+                // as no descriptor arriving by that edge; the lowering
+                // gives those lanes another edge's.
+                Err(COMPUTED | GATHERED) if self.skips_to(q, block) => args.push(None),
                 Err(e) => {
                     joins.pop();
                     return Err(e);
@@ -1633,6 +1669,9 @@ impl<'a> Tracer<'a> {
             }
         }
         joins.pop();
+        if args.iter().all(Option::is_none) {
+            return Err("a descriptor no edge of its join brings");
+        }
         Ok(Some(Source::LanePhi { block, args }))
     }
 
@@ -1712,7 +1751,15 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        // Every condition below is asked of the lanes that reach the loop.
+        // Unmet by any lane at all, it is unmet by those: asked first
+        // without `reach`, whose form deep in a long program can be too
+        // large for the search to finish (which then answers "met").
+        let meet = |conditions: &[(Bool, bool)]| {
+            let rest: Vec<_> = conditions.iter().copied().filter(|c| *c != reach).collect();
+            (rest.len() == conditions.len() || lanes.bools.meet(&rest))
+                && lanes.bools.meet(conditions)
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2633,6 +2680,69 @@ pub(crate) mod tests {
         0xBF89_FFF6, // s_cbranch_execnz -> 0x74
         0xBEFE_0317, // s_mov_b32 exec_lo, s23
         0x0618_230C, // v_add_f32 v12, v12, v17
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// A sampler copied into VGPRs under an `if` without `else`: even
+    /// lanes load the table's first sampler and copy it to v[20:23]
+    /// (`v_cmpx`, then an `s_cbranch_execz` over the copy); odd lanes keep
+    /// numbers there. All lanes then sample texture entry 0 in a waterfall
+    /// over v[20:23] (two `v_cmp_eq_u64`, `s_and`, `s_and_saveexec`), as
+    /// the console compiler emits around a sampler chosen in a branch
+    /// (Grand Theft Auto VI's mesh programs), and store to the buffer at
+    /// dword 16 of the table at lane * 4.
+    pub(crate) const WATERFALL_SKIPPED_SAMPLER_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF40C_0402,
+        0xFA00_0000, // s_load_dwordx8 s[16:23], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xD504_0014,
+        0x0201_E502, // v_sub_f32 v20, v2, 1.0
+        0xD504_0015,
+        0x0201_E902, // v_sub_f32 v21, v2, 2.0
+        0xD504_0016,
+        0x0201_FF02,
+        0x4040_0000, // v_sub_f32 v22, v2, 3.0
+        0xD504_0017,
+        0x0201_ED02, // v_sub_f32 v23, v2, 4.0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0xBE98_037E, // s_mov_b32 s24, exec_lo
+        0x7DA4_0E80, // v_cmpx_eq_u32 0, v7 (even lanes)
+        0xBF88_0007, // s_cbranch_execz -> 0x7c
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E28_0208, // v_mov_b32 v20, s8
+        0x7E2A_0209, // v_mov_b32 v21, s9
+        0x7E2C_020A, // v_mov_b32 v22, s10
+        0x7E2E_020B, // v_mov_b32 v23, s11
+        0xBEFE_0318, // 0x7c: s_mov_b32 exec_lo, s24
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE99_037E, // s_mov_b32 s25, exec_lo
+        0x7E18_0514, // 0x88: v_readfirstlane_b32 s12, v20
+        0x7E1A_0515, // v_readfirstlane_b32 s13, v21
+        0x7E1C_0516, // v_readfirstlane_b32 s14, v22
+        0x7E1E_0517, // v_readfirstlane_b32 s15, v23
+        0x7DC4_280C, // v_cmp_eq_u64 vcc_lo, s[12:13], v[20:21]
+        0xD4E2_001A,
+        0x0202_2C0E, // v_cmp_eq_u64 s26, s[14:15], v[22:23]
+        0x871A_1A6A, // s_and_b32 s26, vcc_lo, s26
+        0xBE9A_3C1A, // s_and_saveexec_b32 s26, s26
+        0xF09C_0F08,
+        0x0064_0C02, // image_sample_lz v[12:15], v[2:3], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_1A7E, // s_xor_b32 exec_lo, exec_lo, s26
+        0xBF89_FFF2, // s_cbranch_execnz -> 0x88
+        0xBEFE_0319, // s_mov_b32 exec_lo, s25
         0xE070_1000,
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm

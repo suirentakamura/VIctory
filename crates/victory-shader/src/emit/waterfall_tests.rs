@@ -259,6 +259,19 @@ fn lanes_read_the_base_level_of_their_own_entry_in_a_waterfall() {
 }
 
 #[test]
+fn lanes_that_skipped_a_sampler_copy_sample_with_another_lanes_sampler() {
+    use crate::resource::tests::WATERFALL_SKIPPED_SAMPLER_WAVE32;
+    let shader = build(WATERFALL_SKIPPED_SAMPLER_WAVE32, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    for (label, red) in results {
+        // Every lane samples entry 0; the odd lanes, which hold numbers
+        // where the sampler goes, with the even lanes' sampler.
+        assert_eq!(red, vec![1.0; 32], "{label}");
+    }
+}
+
+#[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
     // Lanes below 16 hold the first descriptor, the others the second.

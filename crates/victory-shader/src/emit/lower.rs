@@ -525,10 +525,13 @@ impl<'a> Lower<'a> {
             // within one wave, where the console compiler leaves out barriers.
             // Swizzles and DPP read lanes of the same 32 (rows of 16, groups
             // of 8, 32 or 4): the rest may read the other half of a wave64.
+            // So do implicit-derivative samples, which take their
+            // gradients from the lane's quad (`quad_gradients`).
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
                     || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || matches!(i.name(), "image_sample" | "image_sample_o" | "image_sample_b")
             };
             // Spills and reloads the reload forwarding made dead read no
             // lanes (see `sgpr_spill`).
@@ -2550,6 +2553,58 @@ impl<'a> Lower<'a> {
             111,
             &[],
         )
+    }
+
+    /// Whether the program is a compute program.
+    fn compute(&self) -> bool {
+        self.x.native.stage == HwStage::Cs
+    }
+
+    /// `sampleGrad` with `args` (handles, coordinates, offsets, gradients,
+    /// clamp).
+    fn sample_grad(&mut self, c: usize, args: &[V]) -> V {
+        let ret = self.s.t.res_ret;
+        self.s.op(c, "sampleGrad.f32", Attr::ReadOnly, ret, 63, args)
+    }
+
+    /// The gradients a compute program's implicit-derivative sample takes,
+    /// as the console takes them: from the lane's quad (four consecutive
+    /// lanes, 2x2), coarse (the quad's second lane less its first across,
+    /// its third less its first down), for the first `dims` coordinates of
+    /// `cs`, scaled by 2^`bias`. Six values: across, then down. The lanes
+    /// are the console's (such programs run with its lane order; see
+    /// `lower`).
+    fn quad_gradients(&mut self, cs: &[V], dims: usize, bias: Option<V>) -> Vec<V> {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let fu = self.s.m.undef(self.s.t.f32);
+        let scale = bias.map(|b| self.unary(21, b));
+        let mut g = vec![fu; 6];
+        for k in 0..dims {
+            let bits = self.as_int(cs[k]);
+            let mut at = [fu; 3];
+            for (n, slot) in at.iter_mut().enumerate() {
+                let lane = self.s.m.i32(n as u32);
+                let read = self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[bits, lane],
+                );
+                *slot = self.as_float(read);
+            }
+            let mut across = self.s.m.bin(c, Bin::Sub, at[1], at[0]);
+            let mut down = self.s.m.bin(c, Bin::Sub, at[2], at[0]);
+            if let Some(scale) = scale {
+                across = self.s.m.bin(c, Bin::Mul, across, scale);
+                down = self.s.m.bin(c, Bin::Mul, down, scale);
+            }
+            g[k] = across;
+            g[3 + k] = down;
+        }
+        g
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -4604,10 +4659,19 @@ impl<'a> Lower<'a> {
             Source::LanePhi { block, args } => {
                 // Each predecessor computes its heap index at its end (what
                 // it reads is there: the dwords are, on that edge); the join
-                // picks the one of the edge the lane came by. An edge no
-                // lane reading it takes gives index 0.
+                // picks the one of the edge the lane came by. An edge that
+                // brings no descriptor (no lane reading it takes it, or its
+                // lanes hold numbers there: see `resource::Tracer::lane_phi`)
+                // gives another edge's, where that index needs only the
+                // entry's values (a table or heap entry at a fixed offset),
+                // else 0.
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
+                let stand_in = args.iter().flatten().find(|a| {
+                    matches!(a, Source::Loaded { load, .. }
+                        if self.scalar.get(load).is_some_and(|x| x.dynamic.is_none())
+                            && self.entry_base(*load))
+                });
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
@@ -4623,7 +4687,15 @@ impl<'a> Lower<'a> {
                             self.cur = here;
                             index?
                         }
-                        None => self.s.m.i32(0),
+                        None => match stand_in {
+                            Some(arg) => {
+                                let here = std::mem::replace(&mut self.cur, at);
+                                let index = self.lane_heap_index(arg, sampler);
+                                self.cur = here;
+                                index?
+                            }
+                            None => self.s.m.i32(0),
+                        },
                     };
                     incoming.push((index, at));
                 }
@@ -4675,6 +4747,25 @@ impl<'a> Lower<'a> {
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+    }
+
+    /// Whether the scalar load at `load` reads its base from registers
+    /// that hold the same value from the program's entry (a root
+    /// parameter's), so its heap index can be computed in any block.
+    fn entry_base(&self, load: Site) -> bool {
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            soffset,
+            ..
+        } = &li.fields
+        else {
+            return false;
+        };
+        matches!(soffset, Operand::Scalar { code: NULL, .. })
+            && li
+                .read(Reg::S(*code))
+                .is_some_and(|v| self.x.res.params.iter().any(|p| p.0 == v))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -7262,15 +7353,18 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
                 (62, true)
             }
-            "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
+            // Implicit derivatives: pixel shaders, and compute programs,
+            // where they are taken from the lane's quad as the console does
+            // (see `quad_gradients`); other stages have no quads to take
+            // them from.
+            "image_sample" | "image_sample_o" if self.s.pixel || self.compute() => (60, true),
+            "image_sample_b" if self.s.pixel || self.compute() => (61, true),
             "image_get_lod" if self.s.pixel => (81, true),
-            // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
             // At an explicit level: four texel loads (see `gather_at_level`).
@@ -7449,24 +7543,43 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    if !self.s.pixel {
+                        if kind == 5 {
+                            return Err("a cube sample with implicit derivatives outside pixel shaders");
+                        }
+                        args.extend(self.quad_gradients(&cs, grad_dims, None));
+                        args.push(fu);
+                        self.sample_grad(c, &args)
+                    } else {
+                        args.push(fu);
+                        self.s
+                            .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    }
                 }
                 61 => {
                     // With a16 the bias is an f16 in its word's low half.
                     let bias = addr_val(self, 0)?;
                     let bias = to_float(self, bias);
-                    args.extend(&os);
-                    args.extend([bias, fu]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    if !self.s.pixel {
+                        if kind == 5 {
+                            return Err("a cube sample with implicit derivatives outside pixel shaders");
+                        }
+                        args.extend(&os);
+                        args.extend(self.quad_gradients(&cs, grad_dims, Some(bias)));
+                        args.push(fu);
+                        self.sample_grad(c, &args)
+                    } else {
+                        args.extend(&os);
+                        args.extend([bias, fu]);
+                        self.s.op(
+                            c,
+                            "sampleBias.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            61,
+                            &args,
+                        )
+                    }
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -9365,6 +9478,24 @@ mod tests {
         let words = crate::resource::tests::WATERFALL_BASE_LEVEL_WAVE32;
         let l = lowered(words, vec![table(0), table(1)], 2 << 1).unwrap();
         assert_eq!(l.nonuniform_handles, 2);
+    }
+
+    #[test]
+    fn a_sampler_some_lanes_skipped_copying_lowers_in_a_waterfall() {
+        // Odd lanes skip the copy of the sampler into v[20:23] and keep
+        // numbers there: "a descriptor read from the first lane of computed
+        // VGPRs" before; the edge they take now brings no descriptor.
+        let table = |user_data: u8| crate::native::RootParam {
+            root: crate::native::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let words = crate::resource::tests::WATERFALL_SKIPPED_SAMPLER_WAVE32;
+        let l = lowered(words, vec![table(0), table(1)], 2 << 1).unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
     }
 
     #[test]

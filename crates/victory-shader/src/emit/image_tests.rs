@@ -51,6 +51,7 @@ const fn mimg(op: u32, vdata: u8, vaddr: u8, a16: bool) -> [u32; 2] {
     ]
 }
 
+const IMAGE_SAMPLE: u32 = 0x20;
 const IMAGE_SAMPLE_D_CL: u32 = 0x23;
 const IMAGE_SAMPLE_L_O: u32 = 0x34;
 const IMAGE_SAMPLE_LZ_O: u32 = 0x37;
@@ -235,8 +236,21 @@ fn f16(x: f32) -> u32 {
     exp << 10 | (bits >> 13 & 0x3FF)
 }
 
-// Compute programs here take explicit levels: implicit derivatives
-// (image_sample, _b, _o) are pixel-only in the translation.
+// A compute program's implicit derivatives (image_sample, _b, _o) come
+// from its lanes' quads (`lower::quad_gradients`); with one thread and one
+// level, any level of detail reads level 0.
+
+#[test]
+fn a_compute_sample_with_implicit_derivatives_reads_its_texel() {
+    // image_sample v0, v[3:4]: u, v. Validated as a gradient sample.
+    let shader = build(
+        &[(3, centre(2).to_bits()), (4, centre(3).to_bits())],
+        &mimg(IMAGE_SAMPLE, 0, 3, false),
+    );
+    for (backend, got) in run(&shader) {
+        assert_eq!(got, 32.0, "{backend}: texel (2, 3)");
+    }
+}
 
 #[test]
 fn a_level_zero_sample_with_a_constant_offset_reads_the_offset_texel() {
