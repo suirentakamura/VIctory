@@ -182,48 +182,50 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
     assert!(wrong.is_empty(), "wrong on {wrong:?}");
 }
 
+/// The same loop with a latch block two edges reach, so the EXEC the loop
+/// header joins on its back edge is itself a join. Lane t still runs the
+/// loop t times and stores t + 40.
 #[test]
 fn lane_read_loop_with_a_joined_exec_back_edge() {
     const WAVE: u32 = 64;
     const LANE: u32 = 40;
     let native = program(WAVE, LANE, true);
-    let target = super::Target {
-        lanes_min: 32,
-        lanes_max: 32,
-    };
-    // Emission is required even when WARP cannot run the shader.
-    let mut cs = emit(&native, target);
-    let Ok(host) = Host::new(true) else {
-        eprintln!("no SM 6.6 WARP device; skipped dispatch");
-        return;
-    };
-    let target = host.target();
-    if target.lanes_min > 32 || target.lanes_max < 32 {
-        eprintln!("WARP does not support wave32; skipped dispatch");
-        return;
+    // Emission for a host without 64-lane waves, where no device runs it.
+    emit(
+        &native,
+        super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        },
+    );
+    let want: Vec<u32> = (LANE..LANE + WAVE).collect();
+    for (name, host) in devices() {
+        let mut cs = emit(&native, host.target());
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut cs.dxil)
+                .unwrap_or_else(|e| panic!("{name}: validation: {e}"));
+        }
+        let (root, pso) = host
+            .compute_pipeline(&cs)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        0,
+                        Root::Constants(vec![0; (cs.user_data_dwords() as usize).max(1)]),
+                    )],
+                    views: &[View::RawUav(WAVE)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(out[0], want, "{name}");
+        eprintln!("{name}: joined back edge exact");
     }
-    let Ok(mut validator) =
-        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-    else {
-        eprintln!("no DXIL validator; skipped dispatch");
-        return;
-    };
-    validator.validate(&mut cs.dxil).unwrap();
-    let (root, pso) = host.compute_pipeline(&cs).unwrap();
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(
-                    0,
-                    Root::Constants(vec![0; (cs.user_data_dwords() as usize).max(1)]),
-                )],
-                views: &[View::RawUav(WAVE)],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        )
-        .unwrap();
-    assert_eq!(out[0], (LANE..LANE + WAVE).collect::<Vec<_>>());
 }
