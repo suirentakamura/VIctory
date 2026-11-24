@@ -423,6 +423,10 @@ struct StagingArena {
     current: usize,
     used: u64,
     transient: Vec<(ID3D12Resource, usize, u64)>,
+    /// Buffers of finished submissions too big for a chunk, kept for reuse:
+    /// made anew each submission, the 174 MB snapshots of the title's big
+    /// buffer had the kernel clear gigabytes of pages per frame.
+    spare: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 // SAFETY: pointers are persistent mappings of D3D12 upload/readback buffers
@@ -430,7 +434,9 @@ struct StagingArena {
 unsafe impl Send for StagingArena {}
 
 const STAGING_CHUNK: u64 = 4 << 20;
-const MAX_POOLED_STAGING_CHUNKS: usize = 4;
+const MAX_POOLED_STAGING_CHUNKS: usize = 64;
+/// Bytes of spare big buffers an arena keeps.
+const MAX_SPARE_STAGING: u64 = 1 << 30;
 
 impl StagingArena {
     fn alloc(
@@ -453,9 +459,22 @@ impl StagingArena {
             }
         };
         if alloc_len > STAGING_CHUNK {
-            let (buf, ptr) = make(alloc_len)?;
-            self.transient.push((buf.clone(), ptr as usize, alloc_len));
-            return Some((buf, 0, ptr));
+            // The smallest spare that fits, else a new one of a size more
+            // submissions can use.
+            let best = (self.spare.iter().enumerate())
+                .filter(|(_, s)| s.2 >= alloc_len)
+                .min_by_key(|(_, s)| s.2)
+                .map(|(i, _)| i);
+            let (buf, ptr, size) = match best {
+                Some(i) => self.spare.swap_remove(i),
+                None => {
+                    let size = alloc_len.next_multiple_of(STAGING_CHUNK);
+                    let (buf, ptr) = make(size)?;
+                    (buf, ptr as usize, size)
+                }
+            };
+            self.transient.push((buf.clone(), ptr, size));
+            return Some((buf, 0, ptr as *mut u8));
         }
         if self.used + alloc_len > STAGING_CHUNK && self.current < self.chunks.len() {
             (self.current, self.used) = (self.current + 1, 0);
@@ -474,7 +493,14 @@ impl StagingArena {
     fn reset(&mut self) {
         self.current = 0;
         self.used = 0;
-        self.transient.clear();
+        self.spare.append(&mut self.transient);
+        // Keep the smallest within the budget.
+        self.spare.sort_unstable_by_key(|s| s.2);
+        let mut kept = 0;
+        self.spare.retain(|s| {
+            kept += s.2;
+            kept <= MAX_SPARE_STAGING
+        });
         self.chunks.truncate(MAX_POOLED_STAGING_CHUNKS);
     }
 }
