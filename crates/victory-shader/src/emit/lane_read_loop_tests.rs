@@ -125,9 +125,9 @@ fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShad
         parts: vec![],
     };
     let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = crate::io::raise(&p, native).unwrap();
     let st = crate::structure::structure(&p).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&p, native).unwrap();
     super::emit(&c, native, &p, &st, &io, &res, target).unwrap()
 }
 
