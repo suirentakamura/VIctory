@@ -241,12 +241,13 @@ fn spill_loads(
                         },
                         ("s_and_b32", [x, y]) => {
                             // `s1 & mask` with a small mask, either way round.
+                            // The high dword's eight low bits are address bits
+                            // (40-bit addresses): a mask clearing any of them
+                            // can point elsewhere, so it drops the tag. No
+                            // inline constant (1..=64) keeps them all.
                             let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
                                 (Some((c, _)), Operand::Literal(m)) => {
-                                    tag[c as usize] == 2 && *m <= 0xFFFF
-                                }
-                                (Some((c, _)), Operand::Const(k)) => {
-                                    tag[c as usize] == 2 && (129..=192).contains(k)
+                                    tag[c as usize] == 2 && *m <= 0xFFFF && *m & 0xFF == 0xFF
                                 }
                                 _ => false,
                             };
@@ -1255,6 +1256,43 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    /// A mask on the table pointer's high dword that clears one of its
+    /// address bits points elsewhere: the load through it stays a load
+    /// (found by NexForever on #489).
+    #[test]
+    fn spill_table_masks_keep_every_address_bit() {
+        let loads_left = |mask: u32, inline: bool| {
+            let mut words = vec![0xBE82_0300u32]; // s_mov_b32 s2, s0
+            if inline {
+                words.push(0x8703_0001 | (128 + mask) << 8); // s_and_b32 s3, s1, mask
+            } else {
+                words.extend([0x8703_FF01, mask]); // s_and_b32 s3, s1, lit
+            }
+            words.extend([0xF408_0201, 0xFA00_0010, S_ENDPGM]); // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = build_with(&code, false, 256, true).unwrap();
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name() == "s_load_dwordx4")
+                .count()
+        };
+        for mask in 0..=0xFF {
+            assert_eq!(
+                loads_left(mask, false),
+                usize::from(mask != 0xFF),
+                "{mask:#x}"
+            );
+        }
+        for mask in 1..=64 {
+            assert_eq!(loads_left(mask, true), 1, "inline {mask}");
+        }
+        assert_eq!(loads_left(0x1FF, false), 0);
+        assert_eq!(loads_left(0xFFFF, false), 0);
+        assert_eq!(loads_left(0xFFFE, false), 1);
+        assert_eq!(loads_left(0x1_00FF, false), 1);
     }
 
     /// A compute program whose root arguments are in the spill table `s[0:1]`
