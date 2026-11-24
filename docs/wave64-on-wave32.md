@@ -123,17 +123,26 @@ Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
 wave arrival counters with double-buffered slots and a bounded wait.
 
-### A finding about the per-lane form
+### The console flow on every host
 
-`split_tests::loops_run_while_any_lane_of_the_console_wave_does` (a loop
-lane t runs t times, reading lane 40 in each iteration) is exact in the
-console flow on an RTX 5070. On a Radeon iGPU, the per-lane form (which
-hosts with 64-lane waves get) is wrong: lane 0 ends with 0 instead of 40,
-and lanes 41 to 63 with t instead of t + 40. A lane that has left the
-loop is not there when later iterations read it, and a lane that skipped
-the loop never sees the scalar the loop set. On the console, `v_readlane`
-reads lane 40 whatever EXEC holds. So the console flow may be the better
-form for such programs on AMD too. Not changed there yet.
+The per-lane form is wrong for a program that reads or writes a named
+lane (`v_readlane`, `v_writelane`) where its lanes branch differently
+(#225). Those instructions ignore EXEC on the console and a wave runs a loop
+while any lane does. Per lane, a lane that left a loop or skipped a branch
+is not there to be read or written, and never sees scalars set inside.
+Measured before the change: a loop lane t runs t times, reading lane L in
+each iteration, had 12 of 32 lanes wrong (wave32, RTX 5070 and Radeon) and
+24 of 64 (wave64, Radeon); a `v_writelane` to lane 40 inside a branch only
+lanes below 20 take never wrote lane 40.
+
+Such compute programs now ask for the console flow on every host (the
+second case of `CONSOLE_FLOW`): a program with `v_readlane` or
+`v_writelane`, at least one branch that is not uniform, no `ds_(b)permute`
+and no whole-wave sections. On a host that runs the console's wave size,
+one host wave is the console wave, so ballots are the wave's own and nothing
+is exchanged; any group size and LDS are fine. If the console flow cannot
+lower the program, it keeps the per-lane form (`Parts::per_lane_only`), so
+nothing that translated before is refused.
 
 ## Testing
 

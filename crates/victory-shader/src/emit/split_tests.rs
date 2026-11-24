@@ -298,10 +298,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
 /// the upper half's go on to 63, and the console wave loops while any lane
 /// does. After it, s9 holds lane 40's id, as the last iteration read it.
 ///
-/// The per-lane form (hosts with 64-lane waves) gets this wrong: a lane
-/// that left the loop is not there for the later iterations' lane reads,
-/// and a lane that skipped the loop never sees the scalar it set (on an
-/// RDNA2 iGPU, lane 0 ends with 0 and lanes 41 to 63 with t).
+/// The per-lane form got this wrong on every host (#225); hosts with
+/// 64-lane waves now run it in the console flow too, without exchanges.
 #[test]
 fn loops_run_while_any_lane_of_the_console_wave_does() {
     let body = [
@@ -321,7 +319,7 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
         0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
-    flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
+    console_flow_case("loop t times reading lane 40", &body, 64, |t| t + 40);
 }
 
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only
@@ -354,4 +352,24 @@ fn first_lane_reads_are_the_console_waves() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+}
+
+/// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
+/// it still writes lane 40. The per-lane form never had lane 40 there.
+#[test]
+fn lane_writes_reach_lanes_outside_the_branch() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+        0xBE89_03FF,
+        0x0000_004D, // s_mov_b32 s9, 77
+        0xD761_0002,
+        0x0001_5009, // v_writelane_b32 v2, s9, 40
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (lane < 20) writelane(40, 77)", &body, 64, |t| {
+        if t == 40 { 77 } else { 1 }
+    });
 }
