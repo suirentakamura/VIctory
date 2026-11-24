@@ -936,3 +936,71 @@ fn masked_and_prefix_float_sums_cross_the_halves() {
         n * (n + 1) / 2
     });
 }
+
+/// A select whose selector is a number, not a compare result: a constant
+/// in each mask word, and in the second program a word with a bit that
+/// depends on the group (s8 is 256 in group 1). The lane takes its own
+/// bit of the console's mask: lanes 32..63 of a wave64 the high word's,
+/// each lane of a wave32 the one word's.
+#[test]
+fn selects_on_masks_held_as_numbers() {
+    let constant = [
+        0xBE8A_03FF,
+        0x0F0F_0F0F, // s_mov_b32 s10, 0x0f0f0f0f
+        0xBE8B_03FF,
+        0x3333_3333, // s_mov_b32 s11, 0x33333333
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0xD501_0002,
+        0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
+    ];
+    let built = [
+        0xBE8A_03FF,
+        0x0F0F_0F0F, // s_mov_b32 s10, 0x0f0f0f0f
+        0x880A_080A, // s_or_b32 s10, s10, s8
+        0xBE8B_03FF,
+        0x3333_3333, // s_mov_b32 s11, 0x33333333
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0xD501_0002,
+        0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
+    ];
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        for (label, body, by_group) in [("constant", &constant[..], false), ("built", &built, true)]
+        {
+            for (wave64, threads) in [(true, 64), (false, 64), (false, 32)] {
+                let mut p = program(body, threads);
+                p.wave64 = wave64;
+                let groups = 2;
+                let out = run(&host, &p, groups)
+                    .unwrap_or_else(|e| panic!("{name}: {label} wave64 {wave64}: {e}"));
+                let want: Vec<u32> = (0..groups)
+                    .flat_map(|g| {
+                        // s8 = g * threads * 4: bit 8 in group 1 of 64, bit 7 of 32.
+                        let lo = 0x0F0F_0F0F | if by_group { g * threads * 4 } else { 0 };
+                        (0..threads).map(move |t| {
+                            let (word, lane) = if wave64 && t >= 32 {
+                                (0x3333_3333, t - 32)
+                            } else {
+                                (lo, t % 32)
+                            };
+                            if word >> lane & 1 != 0 { t } else { 7 }
+                        })
+                    })
+                    .collect();
+                assert_eq!(
+                    out, want,
+                    "{name}: a select on a {label} mask, wave64 {wave64}, {threads} threads"
+                );
+                eprintln!(
+                    "{name}: a select on a {label} mask, wave64 {wave64}, {threads} threads exact"
+                );
+            }
+        }
+    }
+}

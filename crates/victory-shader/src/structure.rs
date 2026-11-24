@@ -324,6 +324,11 @@ pub struct Structured {
     /// low dword. What a mask join takes on an edge such a value arrives by:
     /// a loop's exit mask starts as a constant 0 before lanes are added.
     pub others: HashMap<Value, Bool>,
+    /// The high dword read with each low dword of a wave64 mask in
+    /// [`Self::masks`] or [`Self::others`], where the two are different
+    /// values: the halves of a mask held as a number need not come from
+    /// one instruction.
+    pub pairs: HashMap<Value, Value>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -615,6 +620,13 @@ impl<'a> Lanes<'a> {
             guards,
             execs: execs.to_vec(),
             others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            pairs: self
+                .masks
+                .keys()
+                .chain(self.other.keys())
+                .filter(|(lo, hi)| lo != hi)
+                .copied()
+                .collect(),
         })
     }
 
