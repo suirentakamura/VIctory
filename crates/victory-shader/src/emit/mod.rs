@@ -301,7 +301,8 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let spilled = native.spills_root_args();
-    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
+    let mut p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
+    crate::sgpr_spill::forward(&mut p);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
