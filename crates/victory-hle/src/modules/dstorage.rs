@@ -588,6 +588,7 @@ impl Lanes {
         commands.append(&mut lane.unsubmitted);
         for command in commands {
             let hold = !explicit
+                && hold_reads()
                 && match &command {
                     Command::Read(r) => r.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
@@ -1084,6 +1085,17 @@ fn source_name(request: &Request) -> &str {
     }
     // SAFETY: a file object we created; the title keeps it open.
     &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
+}
+
+/// Whether a half-full queue that submits itself holds its reads into
+/// physical pages for the title's Submit: `VICTORY_DSTORAGE_HOLD=1`. Off by
+/// default under Wine: with it on, play92 stayed on the loading screen for
+/// 150 s (the second self-submit held 2,079 reads and the world never
+/// started), with it off the world started after about 40 s and no page
+/// write failed (play93).
+fn hold_reads() -> bool {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HOLD").is_some_and(|v| v != "0"))
 }
 
 /// Queues that submitted themselves, half full (diagnostics).
