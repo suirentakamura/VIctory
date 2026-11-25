@@ -1236,29 +1236,37 @@ mod tests {
 /// per loop the first time and then whenever its total passes a power of two.
 #[cfg(feature = "diagnostics")]
 fn report_loops(bits: &mut [u32]) {
-    use victory_shader::emit::{LOOP_REPORT_SLOTS, LOOP_REPORT_WORD};
-    static TOTALS: Mutex<BTreeMap<(u32, u32), u64>> = Mutex::new(BTreeMap::new());
+    use victory_shader::emit::{LOOP_REPORT_DWORDS, LOOP_REPORT_SLOTS, LOOP_REPORT_WORD};
+    static TOTALS: Mutex<BTreeMap<(u32, u32), (u64, u32)>> = Mutex::new(BTreeMap::new());
     let first = LOOP_REPORT_WORD as usize;
     for slot in 0..LOOP_REPORT_SLOTS as usize {
-        let at = first + 3 * slot;
-        let [id, offset, lanes] = [bits[at], bits[at + 1], bits[at + 2]];
-        bits[at..at + 3].fill(0);
-        if lanes == 0 {
+        let at = first + LOOP_REPORT_DWORDS as usize * slot;
+        let [id, offset, lanes, most] = [bits[at], bits[at + 1], bits[at + 2], bits[at + 3]];
+        bits[at..at + LOOP_REPORT_DWORDS as usize].fill(0);
+        if most == 0 && lanes == 0 {
             continue;
         }
         let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
-        let total = totals.entry((id, offset)).or_insert(0);
-        let before = *total;
-        *total += u64::from(lanes);
-        if before == 0 || total.ilog2() > before.ilog2() {
+        let entry = totals.entry((id, offset)).or_insert((0, 0));
+        let (before, highest) = *entry;
+        entry.0 += u64::from(lanes);
+        entry.1 = highest.max(most);
+        let total = entry.0;
+        // The first sight of a loop, a higher round count than any before
+        // (as a power of two), and the totals of stopped lanes passing one.
+        let news = before == 0 && highest == 0
+            || most > highest && most.ilog2() > highest.max(1).ilog2()
+            || lanes > 0 && (before == 0 || total.ilog2() > before.ilog2());
+        if news {
             let hash = crate::shader_cache::report_name(id);
             tracing::warn!(
                 program = id,
                 shader = hash.as_deref().unwrap_or("?"),
                 loop_at = format_args!("{offset:#x}"),
-                lanes,
-                total = *total,
-                "lanes stopped by the loop limit"
+                stopped_lanes = lanes,
+                stopped_total = total,
+                most_rounds = entry.1,
+                "loop rounds (lanes stopped by the loop limit, highest round count seen)"
             );
         }
     }

@@ -268,7 +268,8 @@ pub fn loop_limit() -> u32 {
 /// [`Options::view_marks`], which the runtime always does). Its program
 /// adds 1 to the count of a slot of the table at [`LOOP_REPORT_WORD`] of the
 /// written-pages bitmap and stores the program's [`loop_report_id`] and the
-/// loop header's code offset in the slot, for the host to log
+/// loop header's code offset in the slot (every 64th round of a loop also
+/// raises the slot's highest count seen), for the host to log
 /// (`victory_gpu::shadow`). Part of the translation, so the shader cache
 /// keys on it ([`loop_limit`] is hashed with it).
 pub fn loop_report() -> bool {
@@ -279,14 +280,17 @@ pub fn loop_report() -> bool {
     })
 }
 
-/// The slots of the loop report table: three dwords each (program id, loop
-/// offset, lanes stopped).
+/// The slots of the loop report table: [`LOOP_REPORT_DWORDS`] each (program
+/// id, loop offset, lanes stopped, highest round count seen).
 pub const LOOP_REPORT_SLOTS: u32 = 64;
+
+/// The dwords of a loop report slot.
+pub const LOOP_REPORT_DWORDS: u32 = 4;
 
 /// The first dword of the loop report table in the written-pages bitmap
 /// ([`VIEW_WRITE_BITS`]), just below the last dword (which takes the marks
 /// of offsets past the bitmap). The host hands out marks only below it.
-pub const LOOP_REPORT_WORD: u32 = VIEW_WRITE_BITS / 32 - 1 - 3 * LOOP_REPORT_SLOTS;
+pub const LOOP_REPORT_WORD: u32 = VIEW_WRITE_BITS / 32 - 1 - LOOP_REPORT_DWORDS * LOOP_REPORT_SLOTS;
 
 /// The bits of the written-pages bitmap marks are handed out from.
 pub const MARK_BITS: u32 = LOOP_REPORT_WORD * 32;

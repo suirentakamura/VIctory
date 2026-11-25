@@ -1609,6 +1609,8 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // The loop report may have ended the block in another one.
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -10272,7 +10274,7 @@ impl<'a> Lower<'a> {
             // The report may end the block: the edge leaves the last one.
             let hit = self.s.m.cmp(c, pred::IUGE, next, limit);
             let offset = self.x.p.blocks[to].offset as u32;
-            self.report_loop(hit, id, offset);
+            self.report_loop(hit, next, id, offset);
         }
         let c = self.cur;
         self.counters
@@ -10283,28 +10285,30 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, p, next, limit)
     }
 
-    /// Diagnostics ([`super::loop_report`]): the lanes of `hit` count
-    /// themselves in the slot of the loop at `offset` of program `id`, and
-    /// leave the program's id and the offset there. Without write marks (no
-    /// bitmap) nothing. May end in a new block.
-    fn report_loop(&mut self, hit: V, id: u32, offset: u32) {
+    /// Diagnostics ([`super::loop_report`]): at a back edge to the loop at
+    /// `offset` of program `id`, whose count is now `next`, the lanes of
+    /// `hit` (stopped by the limit) count themselves in the loop's slot, and
+    /// every 64th round raises the slot's highest count seen. The program's
+    /// id and the offset are left there. Without write marks (no bitmap)
+    /// nothing. May end in a new block.
+    fn report_loop(&mut self, hit: V, next: V, id: u32, offset: u32) {
         let slot = super::loop_report_slot(id, offset);
-        let at = (super::LOOP_REPORT_WORD + 3 * slot) * 4;
+        let at = (super::LOOP_REPORT_WORD + super::LOOP_REPORT_DWORDS * slot) * 4;
         let bitmap = self.s.view_writes_handle();
-        let outer = self.begin_guarded(Some(hit));
+        let c = self.cur;
+        let (k63, zero) = (self.s.m.i32(63), self.s.m.i32(0));
+        let low = self.s.m.bin(c, Bin::And, next, k63);
+        let round = self.s.m.cmp(c, pred::EQ, low, zero);
+        let any = self.s.m.bin(c, Bin::Or, hit, round);
+        let outer = self.begin_guarded(Some(any));
         let c = self.cur;
         let iu = self.s.m.undef(self.s.t.i32);
-        let (word, id_v, offset_v, one) = (
-            self.s.m.i32(at),
-            self.s.m.i32(id),
-            self.s.m.i32(offset),
-            self.s.m.i32(1),
-        );
-        let second = self.s.m.i32(at + 4);
-        let third = self.s.m.i32(at + 8);
-        // Operations: 0 add, 8 exchange.
-        for (op, byte, value) in [(8, word, id_v), (8, second, offset_v), (0, third, one)] {
-            let op = self.s.m.i32(op);
+        let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+        let stopped = self.s.m.select(c, hit, one, zero);
+        let (id_v, offset_v) = (self.s.m.i32(id), self.s.m.i32(offset));
+        // Operations: 0 add, 7 unsigned maximum, 8 exchange.
+        for (op, k, value) in [(8, 0, id_v), (8, 1, offset_v), (0, 2, stopped), (7, 3, next)] {
+            let (op, byte) = (self.s.m.i32(op), self.s.m.i32(at + 4 * k));
             self.s.op(
                 c,
                 "atomicBinOp.i32",
