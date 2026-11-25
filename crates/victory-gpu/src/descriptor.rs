@@ -181,9 +181,10 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.sync(index as u32, start + index * step);
-                }
+                let last = last.min(u64::from(heap.desc.count));
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+                host.sync_slots(first as u32, last as u32, |index| start + u64::from(index) * step);
             }
         }
     }
@@ -442,11 +443,12 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// Whether view record `i` is still of generation `generation`.
+/// Runs `f` with a check of whether view record `i` is still of generation
+/// `generation`, the records locked once for all its checks.
 #[cfg(windows)]
-fn view_is_current(i: u32, generation: u32) -> bool {
+fn with_current<R>(f: impl FnOnce(&dyn Fn(u32, u32) -> bool) -> R) -> R {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+    f(&|i, generation| views.list.get(i as usize).is_some_and(|(_, current)| *current == generation))
 }
 
 /// The view of entry `i` if `generation` is still its own.

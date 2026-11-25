@@ -627,27 +627,38 @@ impl HostHeap {
         }
     }
 
+    /// [`HostHeap::mirror`] for the title's own heap writes, of slots
+    /// `first..last` whose records are at `handle(index)`: most slots of a
+    /// written page hold the record they were made from (2,048 per page, at
+    /// every submission), and are left alone without the view looked up and
+    /// cloned. The slot table's lock and the view records' lock are taken
+    /// once for all of them (they were two lock round trips per slot), and
+    /// the slots whose record changed are mirrored after.
+    pub(crate) fn sync_slots(&self, first: u32, last: u32, handle: impl Fn(u32) -> u64) {
+        let inside = last.min(self.count);
+        let stale: Vec<u32> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            super::with_current(|current| {
+                (first..inside)
+                    .filter(|&index| {
+                        // SAFETY: the handle is a descriptor slot in title
+                        // memory.
+                        let [tag, i, generation] = unsafe { (handle(index) as *const [u32; 3]).read_unaligned() };
+                        let key = u64::from(generation) << 32 | u64::from(i);
+                        !(tag == VIEW_TAG && made[index as usize] == key && current(i, generation))
+                    })
+                    .collect()
+            })
+        };
+        for index in stale.into_iter().chain(inside.max(first)..last) {
+            self.mirror(index, handle(index), false);
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    /// [`HostHeap::mirror`] for the title's own heap writes: most slots of
-    /// a written page hold the record they were made from (2,048 per page,
-    /// at every submission), and are left alone without the view looked up
-    /// and cloned.
-    pub(crate) fn sync(&self, index: u32, handle: u64) {
-        if index < self.count {
-            // SAFETY: the handle is a descriptor slot in title memory.
-            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-            let key = u64::from(generation) << 32 | u64::from(i);
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
-            if tag == VIEW_TAG && made == key && super::view_is_current(i, generation) {
-                return;
-            }
-        }
-        self.mirror(index, handle, false);
-    }
-
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the

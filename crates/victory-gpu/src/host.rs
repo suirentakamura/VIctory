@@ -2180,7 +2180,9 @@ impl HostList {
                     continue;
                 }
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    let mut known = std::mem::take(&mut batch.heaps);
+                    crate::bindless::refresh(viewed, &mut known, |s, a, l| batch.add(s, a, l));
+                    batch.heaps = known;
                     continue;
                 }
                 &Step::Memory(heap) => {
@@ -2220,6 +2222,9 @@ struct Batch {
     current: crate::fast::Map<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: crate::fast::Set<usize>,
+    /// Heaps whose ranges were added since the last title write, by heap:
+    /// the generation of their ranges (`crate::bindless::refresh`).
+    heaps: crate::fast::Map<usize, u64>,
 }
 
 impl Batch {
@@ -2252,6 +2257,7 @@ impl Batch {
         self.flush();
         self.textures.clear();
         self.current.clear();
+        self.heaps.clear();
     }
 
     /// Does the refreshes; returns the bytes copied.
