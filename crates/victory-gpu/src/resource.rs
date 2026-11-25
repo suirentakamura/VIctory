@@ -1265,6 +1265,49 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A texture's extent, for the console descriptor words a program reads
+/// as numbers ([`crate::descriptor`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Shape {
+    /// The title's memory address.
+    pub address: u64,
+    /// D3D12 resource dimension (2 1D, 3 2D, 4 3D).
+    pub dimension: u32,
+    pub width: u64,
+    pub height: u32,
+    pub depth_or_array_size: u32,
+    pub mip_levels: u32,
+    pub samples: u32,
+}
+
+impl ResourceDesc {
+    fn shape(&self, address: u64) -> Shape {
+        Shape {
+            address,
+            dimension: self.dimension,
+            width: self.width,
+            height: self.height,
+            depth_or_array_size: u32::from(self.depth_or_array_size),
+            mip_levels: u32::from(self.mip_levels),
+            samples: self.sample_count,
+        }
+    }
+}
+
+/// A texture's [`Shape`]; `None` for buffers.
+pub(crate) fn texture_shape(this: This) -> Option<Shape> {
+    let (data, desc) = texture_memory(this)?;
+    Some(desc.shape(data as u64))
+}
+
+/// The [`Shape`] of a texture placed at `address` with the resource
+/// description `desc` (as words); `None` for buffers.
+pub(crate) fn placed_shape(address: u64, desc: &[u32; 14]) -> Option<Shape> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.dimension != BUFFER).then(|| d.shape(address))
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)

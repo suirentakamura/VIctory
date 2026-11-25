@@ -1154,20 +1154,40 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
+        let edges: Vec<Vec<Term>> = (0..self.p.blocks[block].preds.len())
             .map(|j| {
-                let edge: Vec<Term> = words
+                words
                     .iter()
                     .map(|w| match phi_of(w) {
                         Some((_, i)) => self.origin(phis[i].args[j]),
                         None => *w,
                     })
-                    .collect();
-                self.classify(&edge, joins, known)
+                    .collect()
             })
-            .collect::<Result<_, _>>();
+            .collect();
+        let mut args: Vec<Result<Source, &'static str>> =
+            edges.iter().map(|edge| self.classify(edge, joins, known)).collect();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        // An edge where the words are registers no root parameter fills
+        // (what the last wave left: a load the branch skipped, as
+        // `s_cbranch_execz` past a block whose lanes are all off does) has
+        // no descriptor the program relies on: it takes another edge's.
+        let stale = |edge: &[Term]| {
+            edge.iter().all(|w| {
+                matches!(*w, Term::Value(v)
+                    if self.inputs.get(v.0 as usize).copied().flatten()
+                        .is_some_and(|r| self.param_of(r).is_none()))
+            })
+        };
+        if let Some(good) = args.iter().find_map(|a| a.as_ref().ok()).cloned() {
+            for (arg, edge) in args.iter_mut().zip(&edges) {
+                if arg.is_err() && stale(edge) {
+                    *arg = Ok(good.clone());
+                }
+            }
+        }
+        let args = args.into_iter().collect::<Result<_, _>>()?;
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
