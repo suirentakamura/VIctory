@@ -72,6 +72,10 @@ wine_env() {
     export VICTORY_DXC
     VICTORY_DXC=$(winpath "$VICTORY_DXC_DLL")
   fi
+  if [ -n "${VICTORY_FIDELITYFX_DIR:-}" ]; then
+    VICTORY_FIDELITYFX_DIR=$(winpath "$VICTORY_FIDELITYFX_DIR")
+    export VICTORY_FIDELITYFX_DIR
+  fi
   # Wine's loader starts the wineserver installed next to wine and ignores
   # $WINESERVER, so start the chosen one ourselves first.
   WINESERVER=$(wineserver_bin)

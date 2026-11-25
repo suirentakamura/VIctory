@@ -28,6 +28,12 @@ VICTORY_GAME_DIR=$HOME/games/gta6-xbox
 # programs VIctory compiles from HLSL at run time; Wine has no DXC of its own.
 #VICTORY_DXC_DLL=$HOME/tools/dxc-win/bin/x64/dxcompiler.dll
 
+# A folder with AMD's PC build of FidelityFX (amd_fidelityfx_upscaler_dx12.dll
+# and its loader): the title's upscaling then runs on the host's own FSR
+# instead of the console's DLL translated. Not tried with every build; see
+# docs/linux-wine.md.
+#VICTORY_FIDELITYFX_DIR=$HOME/tools/fidelityfx
+
 # The patched wineserver (linux/wine/build-wineserver.sh builds it into
 # $VICTORY_HOME/wine-build). "stock" uses the system wineserver.
 #VICTORY_WINESERVER=stock
