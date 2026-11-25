@@ -353,6 +353,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// What each lane holds of a value a section leaves that the lanes
+    /// disagree on (see [`super::wave::Section::lanes`]).
+    section_lanes: HashMap<Value, Vec<Option<super::wave::Shape>>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -856,6 +859,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            section_lanes: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1217,6 +1221,9 @@ impl<'a> Lower<'a> {
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
+                for (&v, lanes) in &sec.lanes {
+                    self.section_lanes.insert(v, lanes.clone());
+                }
                 for i in start + 1..sec.end {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
                         inside.insert(w, (b, start, sec.end));
@@ -1264,6 +1271,26 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+    }
+
+    /// The shape of the value that `inst`, a `v_readlane_b32` of a constant
+    /// lane, reads from a section's lane table.
+    fn section_lane_shape(
+        &self,
+        inst: &Inst,
+        v: &crate::gfx10::Valu,
+    ) -> Option<super::wave::Shape> {
+        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+            return None;
+        };
+        let x = inst.read(Reg::V(reg))?;
+        let lanes = self.section_lanes.get(&x)?;
+        let lane = match *v.src.get(1)? {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(l) => l,
+            _ => return None,
+        };
+        lanes.get(lane as usize).copied().flatten()
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -6568,6 +6595,15 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // A constant lane of a value a whole-wave section left in lanes
+            // that disagree: that lane's own shape (the reduction in the top
+            // lane, read after EXEC is restored).
+            "v_readlane_b32"
+                if let Some(shape) = self.section_lane_shape(inst, v) =>
+            {
+                let r = self.shape(shape)?;
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
