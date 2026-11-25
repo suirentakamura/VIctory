@@ -1326,6 +1326,67 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::F64(high, lo, hi, mask) => {
+                // The sum of the constant 1.0 over the lanes: their count as
+                // an f64 (the host needs no doubles: made in integer steps).
+                // shortcut: other terms (data) are refused.
+                let none = HashMap::new();
+                let (lo, hi) = (self.konst(&none, lo), self.konst(&none, hi));
+                if (lo, hi) != (Some(0), Some(0x3FF0_0000)) {
+                    return Err("a 64-bit wave sum of data");
+                }
+                if self.mask_data == MaskData::None {
+                    return Err("a wave reduction in a mesh shader");
+                }
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                self.s.flags |= flags::WAVE_OPS;
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let b = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                let mut n = self.s.m.i32(0);
+                for w in 0..4 {
+                    let word = self.s.m.extract(c, b, w);
+                    let bits = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[word]);
+                    n = self.s.m.bin(c, Bin::Add, n, bits);
+                }
+                // n = 2^p * (1 + frac / 2^32): p from the leading zeros.
+                let lz = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[n]);
+                let (k31, k1, k12, k20, k1023, zero) = (
+                    self.s.m.i32(31),
+                    self.s.m.i32(1),
+                    self.s.m.i32(12),
+                    self.s.m.i32(20),
+                    self.s.m.i32(1023),
+                    self.s.m.i32(0),
+                );
+                let empty = self.s.m.cmp(c, pred::EQ, n, zero);
+                // (n << lz) << 1 drops the leading one (lz up to 31).
+                let up = self.s.m.bin(c, Bin::Shl, n, lz);
+                let frac = self.s.m.bin(c, Bin::Shl, up, k1);
+                let p = self.s.m.bin(c, Bin::Sub, k31, lz);
+                let exp = self.s.m.bin(c, Bin::Add, p, k1023);
+                let r = if high {
+                    let top = self.s.m.bin(c, Bin::LShr, frac, k12);
+                    let e = self.s.m.bin(c, Bin::Shl, exp, k20);
+                    self.s.m.bin(c, Bin::Or, e, top)
+                } else {
+                    self.s.m.bin(c, Bin::Shl, frac, k20)
+                };
+                return Ok(self.s.m.select(c, empty, zero, r));
+            }
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {

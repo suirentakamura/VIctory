@@ -90,6 +90,16 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// A half of the sum (`v_add_f64`) over `lanes` of the f64 whose low
+    /// and high dwords are `lo` and `hi` where `mask` holds, 0.0 elsewhere:
+    /// the high dword if `high`.
+    F64 {
+        high: bool,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+    },
     /// A 16-bit operation's result: the low half is `op` over `lanes` of
     /// the low halves of `mask ? src : ident`; the high half is that of
     /// lane `hi`'s `mask ? src : ident` (16-bit results keep the
@@ -118,6 +128,9 @@ pub(crate) enum Shape {
     /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
     /// giving the high half.
     Half(Op, Value, Value, u32, u32),
+    /// A dword (the high one if the flag) of the f64 sum, over every lane,
+    /// of `mask ? (hi:lo) : 0.0`: the flag, lo, hi, mask.
+    F64(bool, Value, Value, Value),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -325,6 +338,74 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
+/// A lane's f64 as the source of a sum: (lo, hi, mask, lanes), from its two
+/// dwords, or `None` for zero (0.0, which adds nothing) or what is not one.
+fn f64_term(lo: Sym, hi: Sym) -> Option<Option<(Value, Value, Value, u64)>> {
+    match (lo, hi) {
+        (Sym::K(0), Sym::K(0)) => Some(None),
+        (
+            Sym::Red {
+                op: None,
+                src: l,
+                mask: m,
+                ident: 0,
+                lanes: a,
+            },
+            Sym::Red {
+                op: None,
+                src: h,
+                mask: m2,
+                ident: 0,
+                lanes: b,
+            },
+        ) if m == m2 && a == b => Some(Some((l, h, m, a))),
+        (
+            Sym::F64 {
+                high: false,
+                lo: l,
+                hi: h,
+                mask: m,
+                lanes: a,
+            },
+            Sym::F64 {
+                high: true,
+                lo: l2,
+                hi: h2,
+                mask: m2,
+                lanes: b,
+            },
+        ) if (l, h, m, a) == (l2, h2, m2, b) => Some(Some((l, h, m, a))),
+        _ => None,
+    }
+}
+
+/// The two dwords of the sum of two f64 lanes, as [`Sym`]s.
+fn add_f64(a: (Sym, Sym), b: (Sym, Sym)) -> (Sym, Sym) {
+    let unknown = (Sym::Unknown, Sym::Unknown);
+    let (Some(x), Some(y)) = (f64_term(a.0, a.1), f64_term(b.0, b.1)) else {
+        return unknown;
+    };
+    let (l, h, m, lanes) = match (x, y) {
+        (None, None) => return (Sym::K(0), Sym::K(0)),
+        (Some(t), None) | (None, Some(t)) => t,
+        (Some((l, h, m, a)), Some((l2, h2, m2, b))) => {
+            // Each lane once: the sum counts it.
+            if (l, h, m) != (l2, h2, m2) || a & b != 0 {
+                return unknown;
+            }
+            (l, h, m, a | b)
+        }
+    };
+    let half = |high| Sym::F64 {
+        high,
+        lo: l,
+        hi: h,
+        mask: m,
+        lanes,
+    };
+    (half(false), half(true))
+}
+
 fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, LaneShapes) {
     let all = if wave == 64 {
         u64::MAX
@@ -373,8 +454,20 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
             {
                 masked.push(w);
             }
+            // A move passes a uniform on (the f64 sum's two dwords reach
+            // the section's end through them).
+            let moved = match (name, src.first()) {
+                ("s_mov_b32", Some(&Operand::Scalar { code, .. })) if code != NULL => inst
+                    .read(Reg::S(code))
+                    .map(|x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                ("s_mov_b32", Some(&Operand::Literal(k))) => Some(Sym::K(k)),
+                _ => None,
+            };
             for &(_, w) in &inst.writes {
-                uni.entry(w).or_insert(Sym::Unknown);
+                match moved {
+                    Some(m) => uni.insert(w, m),
+                    None => uni.insert(w, Sym::Unknown),
+                };
             }
             continue;
         }
@@ -407,6 +500,48 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        if name == "v_add_f64" {
+            // A sum of f64 lanes (two dwords each): whole when no modifier
+            // and every lane writes.
+            let pair = |op: &Operand| -> Option<(Vec<Sym>, Vec<Sym>)> {
+                match *op {
+                    Operand::Vector { reg, .. } => Some((
+                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
+                        lanes(&Operand::Vector { reg: reg + 1, dwords: 1 }, &vec, &uni),
+                    )),
+                    Operand::Scalar { code, .. } if code != NULL => Some((
+                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
+                        lanes(&Operand::Scalar { code: code + 1, dwords: 1 }, &vec, &uni),
+                    )),
+                    _ => None,
+                }
+            };
+            let (Some(Operand::Vector { reg: d, .. }), Some(a), Some(b)) = (
+                v.dst,
+                v.src.first().and_then(pair),
+                v.src.get(1).and_then(pair),
+            ) else {
+                for &(_, w) in &inst.writes {
+                    vec.insert(w, vec![Sym::Unknown; wave as usize]);
+                }
+                continue;
+            };
+            let (lo, hi) = (inst.write(Reg::V(d)), inst.write(Reg::V(d + 1)));
+            let sums: Vec<(Sym, Sym)> = if modifiers || exec != all {
+                vec![(Sym::Unknown, Sym::Unknown); wave as usize]
+            } else {
+                (0..wave as usize)
+                    .map(|l| add_f64((a.0[l], a.1[l]), (b.0[l], b.1[l])))
+                    .collect()
+            };
+            if let Some(w) = lo {
+                vec.insert(w, sums.iter().map(|s| s.0).collect());
+            }
+            if let Some(w) = hi {
+                vec.insert(w, sums.iter().map(|s| s.1).collect());
+            }
+            continue;
+        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -646,6 +781,13 @@ fn shapes(
             lanes,
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
+        Sym::F64 {
+            high,
+            lo,
+            hi,
+            mask,
+            lanes,
+        } if lanes == all => Some(Shape::F64(high, lo, hi, mask)),
         _ => None,
     };
     for (v, s) in uni {
@@ -695,6 +837,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::F64 {
+                high,
+                lo,
+                hi,
+                mask,
+                lanes,
+            } if lanes == all => Some(Shape::F64(high, lo, hi, mask)),
             _ => None,
         };
     }
@@ -1034,6 +1183,47 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    #[test]
+    fn f64_sums_of_two_lanes_hold_both_lanes_in_both_dwords() {
+        let (lo, hi, mask) = (Value(1), Value(2), Value(3));
+        let lane = |l: u32, high: bool| Sym::Red {
+            op: None,
+            src: if high { hi } else { lo },
+            mask,
+            ident: 0,
+            lanes: 1 << l,
+        };
+        let (a, b) = ((lane(0, false), lane(0, true)), (lane(1, false), lane(1, true)));
+        let sum = add_f64(a, b);
+        let half = |high, lanes| Sym::F64 {
+            high,
+            lo,
+            hi,
+            mask,
+            lanes,
+        };
+        assert_eq!(sum, (half(false, 3), half(true, 3)));
+        // The same lane twice would count it twice: not a sum of lanes.
+        assert_eq!(add_f64(a, a), (Sym::Unknown, Sym::Unknown));
+        // Zero (the DPP fetch of nothing) adds nothing.
+        assert_eq!(add_f64(a, (Sym::K(0), Sym::K(0))), (half(false, 1), half(true, 1)));
+        // A half sum and another half's lanes join.
+        let more = add_f64(sum, (lane(2, false), lane(2, true)));
+        assert_eq!(more, (half(false, 7), half(true, 7)));
+        // Different data or masks do not.
+        let other = (
+            lane(3, false),
+            Sym::Red {
+                op: None,
+                src: Value(9),
+                mask,
+                ident: 0,
+                lanes: 1 << 3,
+            },
+        );
+        assert_eq!(add_f64(sum, other), (Sym::Unknown, Sym::Unknown));
     }
 
     #[test]
