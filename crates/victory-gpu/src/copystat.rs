@@ -106,8 +106,10 @@ pub(crate) enum C {
     LastFlushNs,
     CopiesWaitNs,
     HeapsKnown,
+    /// Submissions queued behind another one (the GPU gated on its finish).
+    Gated,
 }
-const COUNTERS: usize = 63;
+const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -239,7 +241,7 @@ pub(crate) fn log(frames: f64) {
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
          heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved, {:.0} written by the title meanwhile; \
          descriptor heap pass {:.1} ms over {:.0} slots; last refresh batch {:.1} ms; waiting for the copy-back before {:.1} ms; \
-         {:.0} heap passes already in their batch; working set {:.0} MB, {:.0} hard faults",
+         {:.0} heap passes already in their batch; {:.1} submissions queued behind another; working set {:.0} MB, {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -304,6 +306,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::LastFlushNs as usize]),
         ms(c[C::CopiesWaitNs as usize]),
         c[C::HeapsKnown as usize],
+        c[C::Gated as usize],
         working_set() as f64 / 1e6,
         {
             static HARD: AtomicU64 = AtomicU64::new(0);
