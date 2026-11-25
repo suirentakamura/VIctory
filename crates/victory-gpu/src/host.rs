@@ -911,7 +911,11 @@ impl Host {
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
-        crate::descriptor::sync_heaps();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(crate::clock::now(), crate::copystat::C::SyncHeapsNs);
+            crate::descriptor::sync_heaps();
+        }
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -992,7 +996,11 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(crate::clock::now(), crate::copystat::C::LastFlushNs);
+            batch.flush();
+        }
         // The shaders mark the pages they write in one bitmap, read after
         // the run: the submission before must be done with it.
         settle(3);
@@ -2252,7 +2260,11 @@ impl Batch {
         let _timed = crate::watch::Timed(crate::clock::now(), crate::copystat::C::FlushNs);
         self.pending.clear();
         let mut total = 0;
+        #[cfg(feature = "diagnostics")]
+        let waited = crate::watch::Timed(crate::clock::now(), crate::copystat::C::CopiesWaitNs);
         let _exclusive = (!self.refreshes.is_empty()).then(|| TITLE_COPIES.lock().unwrap_or_else(|e| e.into_inner()));
+        #[cfg(feature = "diagnostics")]
+        drop(waited);
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = crate::clock::now();
             let copied = shadow.update(from, to - from);
