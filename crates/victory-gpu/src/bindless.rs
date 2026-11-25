@@ -54,7 +54,10 @@ struct Inner {
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
-    hulls: Option<Vec<Hull>>,
+    hulls: Option<Arc<Vec<Hull>>>,
+    /// Bumped whenever `hulls` may change: a submission's batch that has
+    /// the hulls of one generation needs them only once ([`refresh`]).
+    generation: u64,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -91,6 +94,7 @@ impl Inner {
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
                     self.hulls = None;
+                    self.generation += 1;
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -131,10 +135,16 @@ impl Viewed {
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
-    fn ranges(&self) -> Vec<Hull> {
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn ranges(&self) -> Arc<Vec<Hull>> {
+        self.ranges_now().1
+    }
+
+    /// [`Viewed::ranges`] and their generation.
+    fn ranges_now(&self) -> (u64, Arc<Vec<Hull>>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hulls) = &inner.hulls {
-            return hulls.clone();
+            return (inner.generation, hulls.clone());
         }
         let hulls: Vec<Hull> = inner
             .ends
@@ -144,8 +154,9 @@ impl Viewed {
                 Some((shadow.clone(), from, to - from, uav))
             })
             .collect();
+        let hulls = Arc::new(hulls);
         inner.hulls = Some(hulls.clone());
-        hulls
+        (inner.generation, hulls)
     }
 }
 
@@ -253,9 +264,24 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+///
+/// `known`: the generation of each heap's ranges (by heap) already given to
+/// the batch since a step last wrote title memory; ranges given again then
+/// would change nothing (the batch has them pending or brought up to date),
+/// and every list of a world submission asked for thousands of them.
+pub(crate) fn refresh(
+    viewed: &Viewed,
+    known: &mut crate::fast::Map<usize, u64>,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let (generation, hulls) = viewed.ranges_now();
+    if known.insert(std::ptr::from_ref(viewed) as usize, generation) == Some(generation) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HeapsKnown, 1);
+        return;
+    }
+    for (shadow, address, len, _) in hulls.iter() {
+        add(shadow, *address as usize, *len as usize);
     }
 }
 

@@ -284,7 +284,46 @@ fn open(g: &mut Guards, page: usize) -> bool {
     true
 }
 
+/// Gives write access back to `pages` (in order, all guarded by us): a
+/// protection change per run of consecutive pages, page by page where a
+/// run fails (it spans two of the runtime's mappings).
+fn open_pages(g: &mut Guards, pages: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only (failing harmlessly if gone).
+        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READWRITE, &mut old) != 0 }
+    };
+    let mut i = 0;
+    while i < pages.len() {
+        let first = i;
+        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 {
+            i += 1;
+        }
+        let run = &pages[first..=i];
+        i += 1;
+        for page in run {
+            g.protected.remove(page);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::OpenPages, run.len() as u64);
+        if run.len() == 1 || !set(run[0], run[run.len() - 1] + 1) {
+            for &page in run {
+                set(page, page + 1);
+            }
+        }
+    }
+}
+
 impl Tracked {
+    /// Page `page` (a page number) differs from the copy after all: the
+    /// title wrote it while it was open ([`writing_runs`]).
+    pub(crate) fn mark_changed(&self, page: usize) {
+        if (self.start / PAGE..self.end.div_ceil(PAGE)).contains(&page) {
+            self.changed.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+        }
+    }
+
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
@@ -491,9 +530,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// lands: trackers armed for a page they had taken keep its bytes.
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
-    }
+    open_pages(g, &guarded);
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -537,6 +574,50 @@ impl Drop for Writing {
         }
         changed(&mut g, self.first, self.last, false);
     }
+}
+
+/// Writes into title memory the guards do not see, under way at once
+/// ([`writing_runs`]): their pages, in runs.
+#[must_use = "the writes must happen while this lives"]
+pub(crate) struct WritingRuns(Vec<(usize, usize)>);
+
+impl Drop for WritingRuns {
+    fn drop(&mut self) {
+        let mut g = guards();
+        for &(first, last) in &self.0 {
+            if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, first, last, false);
+        }
+    }
+}
+
+/// [`writing`] for many ranges of title memory (`[from, to)` each) at once,
+/// with the guard lock taken once and the protection of each run of
+/// consecutive guarded pages changed by one call: the copy-back of the
+/// pages shaders marked opens thousands of pages per frame, which took two
+/// protection changes and four lock round trips each.
+pub(crate) fn writing_runs(ranges: &[(usize, usize)]) -> WritingRuns {
+    let mut pages: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(from, to)| from < to)
+        .map(|&(from, to)| (from / PAGE, to.div_ceil(PAGE)))
+        .collect();
+    pages.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for (first, last) in pages {
+        match runs.last_mut() {
+            Some((_, end)) if first <= *end => *end = (*end).max(last),
+            _ => runs.push((first, last)),
+        }
+    }
+    let mut g = guards();
+    for &(first, last) in &runs {
+        g.busy.push((first, last));
+        changed(&mut g, first, last, true);
+    }
+    WritingRuns(runs)
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

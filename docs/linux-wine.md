@@ -63,6 +63,27 @@ flight, about 270 ms a frame (3.7 fps) is the limit until those shrink.
   - Blocking fence waits and present let the submission in flight finish
     first.
   - `VICTORY_SYNC_SUBMIT=1` brings back the synchronous path; tests use it.
+- **Copy-back in one pass, on worker threads.** The pages shaders mark as
+  written through views (about 2,700 a frame, 62 ms one page at a time) are
+  planned together, their title pages opened in runs under one take of the
+  guard lock, compared and written back on a pool of copy workers
+  (`VICTORY_COPY_THREADS`, default a third of the logical processors, at
+  most 8; 1 runs on the one thread), then taken again per copy and compared
+  once more, since a title write while a page was open does not fault.
+- **A second submission queued behind the one in flight.** The title's
+  thread no longer waits at each hand-over for the submission before to
+  finish, copy-back included: up to `VICTORY_SUBMIT_DEPTH` submissions
+  (default 2; 1 is the previous behaviour) are on the host queue, and the GPU
+  starts a queued one only when the completion thread has finished the one
+  before and signalled a gate fence. So the copy-back still runs with the GPU
+  idle and the shaders' bitmap clear, but the title prepares ahead (for
+  submissions that are long to prepare and short to run, and the other way
+  round). Steps that read memory a submission in flight may write, list
+  resets and blocking fence waits wait for all submissions in flight.
+- **Fewer lock round trips.** The descriptor heap pass takes the slot
+  table's and the view records' locks once per heap page instead of twice per
+  slot, and a heap whose ranges the submission's batch already has (since a
+  step last wrote title memory) adds nothing again.
 - **Thread placement (`victory-hle/src/modules/cpus.rs`).** The title pins
   its threads with masks for the console's 7 cores (14 logical processors).
   Passed through unchanged, they kept the title on the host's first 14
@@ -190,15 +211,15 @@ In order, toward at least 10 fps in the cinematic:
 1. **Fix the skinning loop** (open problems 1 and 2). Disassemble the program
    and compare its loop exit with the console code. It is the largest single
    GPU cost and probably the character geometry bug.
-2. **Batch the copy-back.** About 50 ms a frame goes on copying GPU-written
-   pages back one at a time; gather them into one pass per submission.
-3. **More than one submission in flight.** The CPU now overlaps the GPU, but
-   only by one submission. A deeper queue needs the write-mark bitmap and the
-   per-copy state split per submission.
-4. **Spread the preparation over threads.** About 200 ms of single-threaded
-   CPU work a frame. Pages can be compared and copied in parallel. The title's
-   own worker threads mostly wait on the GPU chain today, so the extra cores
-   pay off once the GPU side shrinks.
+2. **Batch the copy-back.** Done (one pass, worker threads); to be measured.
+3. **More than one submission in flight.** Done to depth 2 behind a gate
+   fence. A GPU run that overlaps the copy-back of the submission before
+   needs the write-mark bitmap and the pages' bytes kept per submission (a
+   GPU-side copy of the marked pages); not done.
+4. **Spread the preparation over threads.** The copy-back's page work is.
+   What remains on the submitting thread is the guard bookkeeping: about
+   10,000 protection changes a frame (`VirtualProtect`, 4 us each) and
+   about 2,300 write faults (65 us in the handler, on the title's threads).
 5. **Lighting for characters.** Then the cut-in resolution, and the crash.
 
 ## Variables used for this work
@@ -211,6 +232,8 @@ See [../linux/README.md](../linux/README.md#variables) for the full list.
 | `VICTORY_DXIL=<path to dxil.dll>` | Microsoft's validator, for `translate --validate` and the tests |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | bound every translated loop |
 | `VICTORY_SYNC_SUBMIT=1` | synchronous submission |
+| `VICTORY_SUBMIT_DEPTH=<n>` | submissions on the host queue at once (default 2; 1 as before) |
+| `VICTORY_COPY_THREADS=<n>` | threads for the copy-back's page work, the caller included (default a third of the logical processors, at most 8; 1 on the one thread) |
 
 After a translator change, run `linux/translate.sh` once; the shader cache is
 keyed on the translator's source.
