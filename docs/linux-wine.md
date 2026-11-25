@@ -1,8 +1,11 @@
 # Running under Wine / Proton on Linux
 
-Status of this fork's `linux/upstream` branch, 2026-11-25. It is upstream
-VIctory (`main` at 940d32f) plus fixes found while running the title under
-Wine with vkd3d-proton 3.2 on an AMD RX 9060 XT (RADV). Nothing here needs
+Status of this fork's `linux/upstream-1125` branch, 2026-11-25. It is upstream
+VIctory (`main` at 940d32f) plus open pull requests #332 (partial-channel
+image stores), #1924 (geometry stages) and #1065 (validator 1.8 for compute
+derivatives), plus fixes found while running the title under
+Wine with vkd3d-proton (GE-Proton11-14's build, v3.1-83) on an AMD RX 9060 XT
+(RADV). Nothing here needs
 game data in the repository; supply your own files as usual. The older
 `linux/shaders` and `linux/uma` branches hold earlier work on an older
 upstream (the unified-memory experiment and the wineserver notes are there).
@@ -12,8 +15,8 @@ upstream (the unified-memory experiment and the wineserver notes are there).
 | Stage | State |
 |-------|-------|
 | Boot, menus, loading screen | works |
-| Intro cinematic | draws: world geometry, sky, volumetric clouds, sea, overlaid credits. Characters and near buildings are still unlit; cut-in credit text is missing; 1.6-2 s a frame |
-| Shaders | 25,756 of 26,177 programs translate; every emitted vertex and pixel program (14,255) passes `dxil.dll` validation |
+| Intro cinematic | draws: world geometry, sky, volumetric clouds, sea, overlaid credits. the pipeline pre-build completes; the credits and the end card play; characters and near buildings are still unlit; about 3 frames a second |
+| Shaders | 25,956 programs translate (of 26,177 plus 195 geometry programs); every emitted vertex, pixel, compute, geometry and export program passes `dxil.dll` validation (71 mesh programs exceed the output size limit) |
 
 ## Why the picture was black under Wine
 
@@ -41,12 +44,36 @@ switched off there (the hardware ignores it too).
 - **`v_permlanex16_b32`** through `waveReadLaneAt`.
 - **Descriptor joins** whose other edge holds only stale input registers take
   the defined edge's descriptor.
+- **SCC after an EXEC branch.** An EXEC write's SCC ("EXEC not empty") is
+  known in the successors of the `s_cbranch_execnz`/`_execz` after it (the
+  ped blend-shape skinning reads it after a waterfall loop).
+- **UAVs at every stage**: vertex and geometry programs that bind a UAV (the
+  write-mark bitmap) declare it.
+- **One handle per annotation.** A block that stores floats through a texture
+  view and runs an integer atomic on the same view gets two handles; the
+  atomic reused the float one, and dxil-spirv emitted a float atomic (invalid
+  SPIR-V, 713 programs).
 
-Still refused (native survey): 198 geometry-shader-only containers, 10 mask
-joins of BVH addresses (ray-traced shadows), 8 masks spilled through VGPR
-lanes, 8 f64 wave sums, and a handful of single cases. 750 compute programs
-fail validation only because the container records validator 1.6 while using
-compute derivatives (SM 6.6); vkd3d-proton does not check it.
+## One latch per loop (the pre-build hang)
+
+A GFX10 loop with several branches back to its header became a DXIL loop with
+several back edges. dxil-spirv (inside vkd3d-proton) builds immediate
+dominators by recursing through predecessors that have none yet; on such a
+header that also branches straight into a merge it re-entered the header's
+own computation and recursed without end (any stack size). Wine ends a
+thread whose stack overflows without unwinding it
+(`err:virtual:virtual_setup_exception stack overflow`, hidden by
+`WINEDEBUG=-all`), so `translate --cache --pipelines` lost every worker on
+the 24 ray-traced shadow and BVH tracing programs and hung. The emitter now
+gives each such header one latch block, as LLVM's loop simplification leaves
+DXC's loops. All 25,956 translated programs now convert with a native dxil-spirv and
+pass its SPIR-V validation (`dxil-spirv <file> --validate`, built from the
+commit vkd3d-proton pins).
+
+Still refused (native survey): 10 mask joins of BVH addresses (ray-traced
+shadows), 8 f64 wave sums, 4 ped decal pixel programs joining a stale lane
+mask with data, 3 text shaders shipped as PC DXIL only (no console program;
+not seen created in the cinematic), and 4 single cases.
 
 ## Variables used for this work
 
