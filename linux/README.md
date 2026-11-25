@@ -139,6 +139,7 @@ window. A Wine process left behind is stopped with
 |----------|--------|
 | `VICTORY_KEYS=10:Enter,11:Enter` | press keys at those seconds after launch (diag builds) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | bound every translated loop to n iterations; `play.sh` sets 4096 |
+| `VICTORY_SHADER_LOOP_REPORT=1` | diag builds: log the loops that run 64 rounds or more, their highest count seen and the lanes the limit stopped (re-translates every shader) |
 | `VICTORY_SYNC_SUBMIT=1` | submit and wait for the GPU on the title's thread (the behaviour before asynchronous submission) |
 | `VICTORY_GPU_TIMING=1` | GPU time per program in the log (submissions then wait for the GPU) |
 | `VICTORY_D3D12_DRED=1` | D3D12 device-removed breadcrumbs |

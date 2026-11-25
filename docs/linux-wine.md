@@ -138,23 +138,40 @@ Blending is switched off there; the hardware ignores it too.
   - The emitter now gives each such header one latch block, as LLVM's loop
     simplification does for DXC's loops.
 
-Still refused, from a survey with a native dxil-spirv:
+More programs translate (survey with a native dxil-spirv, 2026-11-25):
 
-- 10 mask joins of BVH addresses (ray-traced shadows);
-- 8 f64 wave sums;
-- 4 ped decal pixel programs that join a stale lane mask with data;
-- 3 text shaders shipped as PC DXIL only;
-- 4 single cases.
+- **A reduction read from the top lane after EXEC is restored.** The three
+  `amd_fidelityfx_upscaler_xbox` programs that end with a wave-wide bit-or
+  read in lane 63 translate (before, the title's FSR ran without them).
+- **Stale registers on skipped edges.** A `v_readfirstlane_b32` or
+  `v_readlane_b32` writes for the whole wave, so it ends a stale register's
+  life; the four `PS_DeferredPedTextured*Decal*` programs translate. A
+  lane-mask join takes no edge that no lane reads from, so the nine
+  `CS_RTShadowTrace32*` programs translate.
+- **f64 wave sums of the constant 1.0** (the water volumes count lanes this
+  way) are lowered as the ballot's lane count made into an f64 in integer
+  steps: three of five `CS_TransmissionVolumetrics*` programs.
+
+Still refused: the three text shaders shipped as PC DXIL only
+(`TextVSQuad`, `TextPS_Tex`, `TextPS_Sdf`: no console program in them), and
+two `CS_TransmissionVolumetrics*` programs (`bd25dcd5`, `bbfb2953`), where a
+mask held across a loop in a parked VGPR lane is joined with a copy of
+itself that the structuring does not see through.
 
 ## Open problems
 
-1. **Ped skinning runs to the loop limit.** `MS_VS_PedTransformPreSkinD` is a
-   mesh program, run through an indirect dispatch. Each dispatch takes 40-80
-   ms, which is most of the frame's GPU time. That time halves when
-   `VICTORY_SHADER_LOOP_LIMIT` drops from 4096 to 256 (play80 against
-   play86). So a loop in its translation never meets its exit and stops only
-   at the limit. That costs time and is a likely cause of the spiked
-   characters.
+1. **The ped draw that takes 40-80 ms.** The slow command is the draw of
+   mesh `MS_VS_PedTransformPreSkinD` with pixel `PS_DeferredPedTexturedNC`.
+   The mesh program has no loop at all (neither its console code nor its
+   DXIL has a back edge), so the loop limit cannot bind there. The pixel
+   program has nine loops: three of three rounds and decal loops of at most
+   15 rounds (counts are 4-bit fields), and a light loop whose count is the
+   whole first dword of a constant buffer (`s_cmp_ge_u32 s42, s40`). The
+   time halves between limits of 4096 and 256 but is still 74 ms at 256, so
+   the loops are not what it is bound by; spiked characters (long triangles
+   covering the screen) in front of this heavy pixel program would do it.
+   `VICTORY_SHADER_LOOP_REPORT=1` (diagnostics builds) logs which loops go
+   long and how long.
 2. **Runaway loops without the limit.** Since the VGPR-lane port, a few
    programs loop on the GPU for about 800 ms a frame unless
    `VICTORY_SHADER_LOOP_LIMIT` is set, which is why `play.sh` sets 4096. It is
