@@ -370,6 +370,13 @@ struct Lower<'a> {
     mode16: Option<u8>,
 }
 
+/// Whether `inst` writes an SGPR for the whole wave, whatever lane it is in:
+/// `v_readfirstlane_b32` and `v_readlane_b32` run (and write) wherever
+/// the wave runs them, in lanes that are off as well.
+fn wave_wide_write(inst: &Inst) -> bool {
+    matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32")
+}
+
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
 fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
@@ -10362,7 +10369,7 @@ impl<'a> Lower<'a> {
                         regs.insert(r);
                         tainted.insert(w);
                     }
-                } else if guard.is_none() {
+                } else if guard.is_none() || wave_wide_write(inst) {
                     for w in &inst.writes {
                         regs.remove(&w.0);
                     }
@@ -10651,6 +10658,7 @@ impl<'a> Lower<'a> {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
                     (Some(Val::Missing(why)), _) if read => {
+                        if std::env::var_os("DBG_PHI").is_some() { eprintln!("PHI {:?} at block {:#x} edge {} (from {:#x}) why {why}", phi.reg, p.blocks[b].offset, n, p.blocks[q].offset); }
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if read => {
