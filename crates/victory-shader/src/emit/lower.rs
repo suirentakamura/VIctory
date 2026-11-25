@@ -269,6 +269,11 @@ struct Lower<'a> {
     lazy: HashMap<Value, Input>,
     /// Every value some instruction or phi reads.
     read: HashSet<Value>,
+    /// SCC of an EXEC-writing operation (SCC: the new EXEC is not empty)
+    /// whose block ends in `s_cbranch_execnz`/`_execz` with no later SCC
+    /// write: the block and its successors for an empty and a non-empty
+    /// EXEC. Read in a successor reached only from there, SCC is known.
+    exec_scc: HashMap<Value, (usize, usize, usize)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
@@ -776,6 +781,7 @@ impl<'a> Lower<'a> {
                     phis.chain(b.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1)))
                 })
                 .collect(),
+            exec_scc: HashMap::new(),
             user_data: None,
             user_reads: BTreeMap::new(),
             root_views: HashMap::new(),
@@ -1828,7 +1834,15 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                if let Some(&(b, empty, nonempty)) = self.exec_scc.get(&v)
+                    && self.x.p.blocks[self.cur_ir].preds == [b]
+                    && (self.cur_ir == empty) != (self.cur_ir == nonempty)
+                {
+                    return Ok(Val::Bit(self.s.m.bool(self.cur_ir == nonempty)));
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -3757,16 +3771,51 @@ impl<'a> Lower<'a> {
             // A mask operation whose SCC (the result is not empty: "any lane
             // left") is read: the mask stays structural, SCC any lane of it.
             // On host waves too: lanes outside the host wave are not in it.
+            // A mask also holding lanes that do not reach here (a
+            // complement of EXEC): its number, where the console's is known.
             let c = self.cur;
-            if let Ok(bit) = self.boolean(m, c) {
-                let i1 = self.s.t.i1;
-                let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
+            let any = if self.x.st.active.contains(&lo) {
+                self.boolean(m, c).map(|bit| {
+                    let i1 = self.s.t.i1;
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[bit])
+                })
+            } else {
+                self.mask_number(lo).map(|(x, y)| {
+                    let c = self.cur;
+                    let xy = self.s.m.bin(c, Bin::Or, x, y);
+                    let z = self.s.m.i32(0);
+                    self.s.m.cmp(c, pred::NE, xy, z)
+                })
+            };
+            if let Ok(any) = any {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(LANE_MASK));
                 }
                 self.vals.insert(scc, Val::Bit(any));
                 return Ok(());
+            }
+        }
+        if inst.write(Reg::S(EXEC)).is_some()
+            && let Some(scc) = scc
+        {
+            let b = self.cur_ir;
+            let block = &self.x.p.blocks[b];
+            let at = block.insts.iter().position(|i| std::ptr::eq(i, inst));
+            let last = block.insts.last().map(Inst::name);
+            if let (Some(at), Exit::Branch { taken, not_taken }) = (at, block.exit)
+                && block.insts[at + 1..].iter().all(|i| i.write(Reg::Scc).is_none())
+                && block.insts[at + 1..].iter().all(|i| i.write(Reg::S(EXEC)).is_none())
+            {
+                match last {
+                    Some("s_cbranch_execnz") => {
+                        self.exec_scc.insert(scc, (b, not_taken, taken));
+                    }
+                    Some("s_cbranch_execz") => {
+                        self.exec_scc.insert(scc, (b, taken, not_taken));
+                    }
+                    _ => {}
+                }
             }
         }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {

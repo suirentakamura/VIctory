@@ -259,3 +259,26 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         }
     }
 }
+
+#[test]
+fn the_scc_a_waterfall_leaves_on_exit_is_clear() {
+    use crate::resource::tests::cmpx_waterfall;
+    // After the folded loop (`s_andn2_wrexec_b32`, `s_cbranch_execnz`), SCC
+    // is "EXEC not empty" of the last pass: clear. The console compiler
+    // reads it (`s_cselect_b32 s3, exec_lo, 0` for a zero); here it picks
+    // 1.0 to scale the sample by, where a set SCC would pick 0.
+    let mut words = cmpx_waterfall(false, true);
+    let restore = words.iter().rposition(|&w| w == 0xBEFE_0317).expect("the EXEC restore");
+    words.splice(
+        restore + 1..restore + 1,
+        [
+            0x851E_F280, // s_cselect_b32 s30, 0, 1.0
+            0x1018_181E, // v_mul_f32 v12, s30, v12
+        ],
+    );
+    let shader = build(&words, false);
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for (label, red) in sampled(&shader) {
+        assert_eq!(red, want, "{label}");
+    }
+}
