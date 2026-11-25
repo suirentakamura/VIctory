@@ -1,6 +1,6 @@
 # victory-suiren
 
-victory-suiren is a fork of [VIctory](https://github.com/marvisak/VIctory)
+[victory-suiren](https://github.com/suirentakamura/victory-suiren) is a fork of [VIctory](https://github.com/marvisak/VIctory)
 that runs on Linux under Wine. VIctory runs Grand Theft Auto VI (Xbox Series
 X|S) natively on Windows, from files the user supplies.
 

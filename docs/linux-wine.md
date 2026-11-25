@@ -1,6 +1,6 @@
 # Running under Wine on Linux (victory-suiren)
 
-This is the state of the `main` branch of victory-suiren (suirentakamura/VIctory)
+This is the state of the `main` branch of [victory-suiren](https://github.com/suirentakamura/victory-suiren)
 as of 2026-11-25. victory-suiren is upstream VIctory (`main` at 940d32f) plus:
 
 - open pull requests #332 (partial-channel image stores), #1924 (geometry

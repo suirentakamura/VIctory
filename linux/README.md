@@ -17,6 +17,13 @@ sudo pacman -S --needed git base-devel flex bison rustup clang lld llvm \
 rustup default stable        # the repository pins its own toolchain
 ```
 
+Get the source:
+
+```sh
+git clone https://github.com/suirentakamura/victory-suiren.git
+cd victory-suiren
+```
+
 `vulkan-radeon` (RADV) is the AMD driver. Use your GPU's Vulkan driver
 instead. Tested versions: Wine 11.22, Mesa 26.3.1, clang/lld/llvm 23.1.5, and
 the Rust toolchain pinned in `rust-toolchain.toml` (1.98.1, with the
