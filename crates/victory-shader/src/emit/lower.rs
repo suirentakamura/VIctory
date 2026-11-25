@@ -295,7 +295,9 @@ struct Lower<'a> {
     /// the wave's lanes with work ([`merged_wave_masks`]). Every host
     /// invocation has work, so they are true.
     merged_wave_mask: HashSet<Value>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Handles made in a block, by descriptor and annotation: a float
+    /// store and an integer atomic through one descriptor annotate it apart.
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -5368,7 +5370,7 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
