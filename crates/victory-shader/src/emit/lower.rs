@@ -10658,7 +10658,6 @@ impl<'a> Lower<'a> {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
                     (Some(Val::Missing(why)), _) if read => {
-                        if std::env::var_os("DBG_PHI").is_some() { eprintln!("PHI {:?} at block {:#x} edge {} (from {:#x}) why {why}", phi.reg, p.blocks[b].offset, n, p.blocks[q].offset); }
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if read => {
@@ -10693,6 +10692,17 @@ impl<'a> Lower<'a> {
                             _ => None,
                         };
                         let untracked = || unsupported(offset, "a lane-mask join of an untracked mask");
+                        // The register holds no mask on this edge (stale
+                        // data), and no lane reads it from there: the
+                        // compiler's save of EXEC in each arm of a ladder,
+                        // read only by lanes that made one.
+                        if word(self, arg).is_none()
+                            && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg))
+                        {
+                            let f = self.s.m.bool(false);
+                            incoming.push((f, qb));
+                            continue;
+                        }
                         let lo = word(self, arg).ok_or_else(untracked)?;
                         let hi = match self.pair_high(arg) {
                             Some(h) => Some(word(self, h).ok_or_else(untracked)?),
