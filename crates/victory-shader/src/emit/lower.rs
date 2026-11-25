@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 
 type Why = &'static str;
+/// Joins deep a descriptor chosen by control flow is followed
+/// ([`Lower::descriptor_phi`]); the tracer gives up at as many.
+const MAX_DESCRIPTOR_JOINS: u32 = 8;
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -1567,6 +1570,11 @@ impl<'a> Lower<'a> {
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
                         Val::I32(self.s.m.i32(0))
                     }
+                    // A scalar parked in a VGPR lane (`ir::unspill`), read
+                    // where the paths only seem to allow it before any save:
+                    // the lane of a VGPR nobody wrote, and VGPRs nobody set
+                    // read as zero.
+                    None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // The primitive mask (pixel), which console code only
                     // moves to M0 for its interpolation (spilled and reloaded
                     // on the way); the host interpolates by itself, so the
@@ -5476,26 +5484,8 @@ impl<'a> Lower<'a> {
                 Ok(ha)
             }
             Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
+                let phi = self.descriptor_phi(*block, args, sampler, MAX_DESCRIPTOR_JOINS)?;
                 let index = self.buffer_guard(src, phi, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
@@ -5571,6 +5561,49 @@ impl<'a> Lower<'a> {
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
             _ => false,
         })
+    }
+
+    /// The heap index a descriptor phi picks. Each predecessor computes its
+    /// heap index at its end and the join picks one with a phi; a
+    /// predecessor whose descriptor is itself chosen by control flow (a
+    /// phi of an earlier join, which dominates it, as the words it holds
+    /// are that join's values) gives that join's phi, at most `depth` joins
+    /// deep.
+    fn descriptor_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        sampler: bool,
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let index = match arg {
+                Source::Loaded { load, first } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, sampler);
+                    self.cur = here;
+                    index?
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?,
+                _ => return Err(WHY),
+            };
+            incoming.push((index, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// The heap index of a descriptor that may differ between lanes,

@@ -187,6 +187,7 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
+        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             let fail = |what| ShaderError::Unsupported {
@@ -272,6 +273,8 @@ pub fn track(
             }
         }
     }
+    // What follows traces no access of one block.
+    t.at.set(None);
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -333,6 +336,8 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// The block of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<usize>>,
     /// Values loaded from the root signature's memory ([`USER_DATA`]): the
     /// root parameter and dword each one is.
     spilled: std::collections::HashMap<Value, (usize, u32)>,
@@ -436,6 +441,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            at: Default::default(),
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
@@ -897,6 +903,15 @@ impl<'a> Tracer<'a> {
 
     /// [`Self::address`] traced to a root parameter or the code.
     fn traced_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        // The high half as the lanes that read through the address hold
+        // it, where that is a constant or what a register held on entry
+        // (the code clears a table address's high half inside a branch
+        // and uses the address after the join).
+        let hi = match self.live(hi) {
+            t @ Term::Const(_) => t,
+            Term::Value(v) if self.inputs[v.0 as usize].is_some() => Term::Value(v),
+            _ => hi,
+        };
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             if s.base.is_some_and(|b| self.heap_base(b)) {
@@ -1224,8 +1239,111 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
-        let args = args.into_iter().collect::<Result<_, _>>()?;
-        Ok(Some(Source::Phi { block, args }))
+        match args.into_iter().collect::<Result<_, _>>() {
+            Ok(args) => Ok(Some(Source::Phi { block, args })),
+            // An edge holds no descriptor. With only one edge the lanes
+            // that read the descriptor can have come by, it is what the
+            // registers hold on that one (a wave that took another edge
+            // has no lane left that reads it), if that can be named where
+            // it is read.
+            Err(e) => {
+                let Some(j) = self.only_edge(block, known) else {
+                    return Err(e);
+                };
+                joins.push(block);
+                let source = self.classify(&edges[j], joins, known);
+                joins.pop();
+                match source {
+                    Ok(source) if self.anywhere(&source) => Ok(Some(source)),
+                    _ => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The one edge into the join `block` that lanes satisfying `known`
+    /// can have taken, if the lanes' paths ([`Structured`]) rule out every
+    /// other: the console compiler loads a descriptor (or clears an
+    /// address's high half) inside a branch that skips code when no lane
+    /// is left for it, and uses it after the join, where only lanes that
+    /// ran the branch are left (the title's `CS_Alpha_Schedule`: the
+    /// registers' values from before the branch, which the join also sees,
+    /// are what a wave with no such lane holds). None at loop headers and
+    /// without the lanes' paths.
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let n = known.len();
+            known.push((lanes.reach[q], true));
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                known.push((when, taken == block));
+            }
+            let possible = meet(lanes, known);
+            known.truncate(n);
+            if possible {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(j);
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone (a table
+    /// offset the code computes exists only where the load is).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                match &inst.fields {
+                    Fields::Smem {
+                        base,
+                        offset,
+                        soffset,
+                        ..
+                    } => self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` as the lanes that reach the access being traced hold it: through
+    /// joins they can have entered by one edge only ([`Self::only_edge`]).
+    fn live(&self, mut t: Term) -> Term {
+        let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+            return t;
+        };
+        let mut known = vec![(lanes.reach[at], true)];
+        for _ in 0..MAX_JOINS {
+            let Term::Value(v) = t else { break };
+            let Some((block, i)) = self.phis[v.0 as usize] else {
+                break;
+            };
+            let Some(j) = self.only_edge(block, &mut known) else {
+                break;
+            };
+            t = self.origin(self.p.blocks[block].phis[i].args[j]);
+        }
+        t
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

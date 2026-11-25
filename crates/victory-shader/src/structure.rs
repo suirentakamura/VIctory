@@ -639,8 +639,48 @@ impl<'a> Lanes<'a> {
             {
                 l.restored.insert(r, s);
             }
+            // The same through a scalar the IR moved out of a VGPR lane
+            // (`ir::unspill`): a 32-bit move from a register that holds one
+            // saved scalar on every path. A lane mask whose halves come back
+            // one at a time (its lanes are not always used as a pair) is
+            // then still the mask that was saved.
+            if inst.name() == "s_mov_b32"
+                && let [(Reg::S(_), from)] = inst.reads[..]
+                && let [(Reg::S(_), r)] = inst.writes[..]
+                && let Ok(Some(s)) = l.parked(from, &mut Vec::new())
+            {
+                l.restored.insert(r, s);
+            }
         }
         Ok(l)
+    }
+
+    /// The scalar `v` holds when it is a copy made by `s_mov_b32` (a save
+    /// into a parking register), the same along every path: `Ok(None)` for
+    /// a phi in `seen` (being resolved).
+    fn parked(&self, v: Value, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.parked(a, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        match (inst.name(), &inst.reads[..]) {
+            ("s_mov_b32", [(Reg::S(_), from)]) => Ok(Some(*from)),
+            _ => Err(()),
+        }
     }
 
     /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
