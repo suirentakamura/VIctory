@@ -1,27 +1,69 @@
-# VIctory
+# victory-suiren
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+victory-suiren is a fork of [VIctory](https://github.com/marvisak/VIctory)
+that runs on Linux under Wine. VIctory runs Grand Theft Auto VI (Xbox Series
+X|S) natively on Windows, from files the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+The title's x86-64 code runs unchanged inside our process. VIctory supplies
+the platform underneath it and converts the title's data. It does this ahead
+of time where it can (shaders and pipelines too, see Getting started) and on
+first use otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-24)
+## Status of victory-suiren (2026-11-25, Linux under Wine)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps,
-loads the world and shows it: slowly, and with rendering defects.
+victory-suiren's `main` is upstream VIctory plus the Wine and Linux work in
+[docs/linux-wine.md](docs/linux-wine.md). It is the exact source of the build
+tested below.
 
-| Stage | State |
+- **Building and running on Arch Linux:** [linux/README.md](linux/README.md).
+  It covers the cross-build, vkd3d-proton and DXVK, the patched wineserver,
+  and the scripts.
+- **Plans and next steps:**
+  [docs/linux-wine.md](docs/linux-wine.md#plans-and-next-steps).
+
+**Not playable.** The title boots, runs its menus at its own 30 fps, loads
+into the first mission's intro cinematic and draws it. But the cinematic runs
+at about 2-2.7 frames a second, and the characters are broken.
+
+| Stage | State under Wine (runs play65-play88) |
 |-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
+| Boot, first-boot screens, intro video, start screen | works, 30 fps |
+| Loading into the world | works, about 1-2 minutes from launch |
+| Intro cinematic: scenery | Drawn: buildings, lit windows and street lights, sky, clouds, sea, depth of field. Distant geometry partly breaks into stray triangles. |
+| Intro cinematic: characters | Drawn as unlit dark silhouettes with spiked, stretched geometry. The skinning program's loop runs to the loop limit (see the open problems). |
+| Frame rate in the world | 2-2.7 fps (370-520 ms a frame), dipping to about 1 fps. Before this round of work it was 0.6-3 fps. Per frame: about 200 ms preparing on the CPU, now overlapped with about 150-250 ms on the GPU, then about 50 ms copying GPU writes back. |
+| Stability | Runs play72-play88 ended at the test timeout or the window closing, with no GPU fault. 1 of 7 earlier runs crashed in the title (access violation). |
+| Shaders | 25,956 programs translate. All pass `dxil.dll` and SPIR-V validation, and the pipeline pre-build completes. |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+What victory-suiren adds for Linux and speed, in short:
+
+- A TSC clock in place of Wine's system-call `QueryPerformanceCounter`.
+- A fast hasher on the hot maps.
+- Asynchronous submission: the GPU wait and copy-back run on their own thread
+  while the next submission is prepared.
+- The console's thread masks spread over all host cores, so a 12-core,
+  24-thread CPU is used instead of the first 14 threads.
+- A wineserver patch that looks up mapped views in a tree.
+- Shader translator fixes that remove the dxil-spirv hang and invalid SPIR-V.
+
+### Test system
+
+| | |
+|-|-|
+| CPU | AMD Ryzen 9 9900X (12 cores, 24 threads) |
+| RAM | 32 GB |
+| GPU | AMD Radeon RX 9060 XT, 16 GB (RDNA 4, GFX1200) |
+| GPU driver | Mesa 26.3.1, RADV (Vulkan 1.4.363) |
+| OS | Arch Linux, kernel 7.3.5-zen1 |
+| Desktop | KDE Plasma 6.8.3, KWin 6.8.3 Wayland compositor; the game window runs through Xwayland 24.1.15 |
+| Wine | Wine 11.22 (Arch `wine` package) with a patched wineserver ([linux/wine](linux/wine)) |
+| Direct3D 12 | vkd3d-proton 3.2 (GE-Proton11-14 build, `v3.1-83-gcae8353ed`) as `d3d12.dll`/`d3d12core.dll` |
+| DXGI | DXVK 2.7.1 `dxgi.dll` (GE-Proton10-32) |
+| VIctory build | `x86_64-pc-windows-msvc`, cross-built on Linux (clang-cl, lld-link, xwin SDK), `diag` profile, shaders pre-built with `translate --cache --pipelines` |
+| Resolution | 1920x1080 |
+
+Upstream's last Windows report (2026-11-24, Windows 11, AMD RX 6700 XT): menus
+at 30 fps, the world drawn at 1-2 s per frame with surfaces unlit.
 
 > **Warning.** Entering the world on a real GPU has hung it in earlier
 > builds, and Windows then resets the display driver (every monitor goes
@@ -41,12 +83,15 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s on Windows (upstream's report), 0.4-0.5 s under Wine on the test system; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
 ## Getting started
+
+On Linux, follow [linux/README.md](linux/README.md) instead; the steps below
+are upstream's, for Windows.
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
@@ -189,6 +234,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SYNC_SUBMIT=1` | each submission waits for the GPU and copies back on the title's thread, as before asynchronous submission (tests always do) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
