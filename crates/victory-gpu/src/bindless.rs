@@ -9,7 +9,8 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use crate::fast::Map as HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -201,7 +202,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     let list = guard.0.as_ref()?;
     let mut recorded = false;
-    let mut done = std::collections::HashSet::new();
+    let mut done = crate::fast::Set::default();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
         // memory) waits in `forget`.

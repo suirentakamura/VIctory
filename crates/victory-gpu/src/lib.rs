@@ -20,6 +20,8 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod clock;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -30,6 +32,8 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
+#[cfg(windows)]
+mod fast;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]

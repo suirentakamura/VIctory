@@ -53,7 +53,7 @@ struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
 #[derive(Default)]
 struct Saved {
     armed: BTreeSet<usize>,
-    bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    bytes: crate::fast::Map<usize, Box<[u8]>>,
 }
 
 impl Changed {
@@ -128,11 +128,11 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    Held(Some(guard), std::time::Instant::now(), line)
+    Held(Some(guard), crate::clock::now(), line)
 }
 
 #[cfg(feature = "diagnostics")]
-struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32);
+struct Held(Option<std::sync::MutexGuard<'static, Guards>>, crate::clock::Stamp, u32);
 
 #[cfg(feature = "diagnostics")]
 impl std::ops::Deref for Held {
@@ -159,7 +159,7 @@ static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
 impl Drop for Held {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let us = self.1.elapsed().as_micros() as u64;
+        let us = self.1.micros();
         drop(self.0.take());
         let line = u64::from(self.2);
         if let Some(slot) = HELD
@@ -296,7 +296,7 @@ impl Tracked {
         }
         let pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
-            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let waited = Timed(crate::clock::now(), crate::copystat::C::GuardWaitNs);
             let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
             #[cfg(feature = "diagnostics")]
             drop(waited);
@@ -313,13 +313,13 @@ impl Tracked {
         // Every address showing the same pages is guarded too. A write in
         // between marks them changed again; the copy, made after, has it.
         #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+        let waited = Timed(crate::clock::now(), crate::copystat::C::GuardWaitNs);
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(waited);
         #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+        let asked = Timed(crate::clock::now(), crate::copystat::C::AliasNs);
         let others = aliases(&g, &whole);
         guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
@@ -339,6 +339,20 @@ impl Tracked {
             }
         }
         runs
+    }
+
+    /// Whether any page of `[from, to)` changed since it was taken.
+    pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && self
+                .changed
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -406,7 +420,7 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
     };
     #[cfg(feature = "diagnostics")]
-    let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
+    let _timed = Timed(crate::clock::now(), crate::copystat::C::ProtectNs);
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
@@ -601,7 +615,7 @@ fn install() {
         }
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
-        let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        let _timed = Timed(crate::clock::now(), crate::copystat::C::HandlerNs);
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -638,13 +652,13 @@ fn writable(at: usize) -> bool {
 
 /// Adds the time since it was made to a counter when dropped (diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) struct Timed(pub(crate) std::time::Instant, pub(crate) crate::copystat::C);
+pub(crate) struct Timed(pub(crate) crate::clock::Stamp, pub(crate) crate::copystat::C);
 
 #[cfg(feature = "diagnostics")]
 impl Drop for Timed {
     fn drop(&mut self) {
         let c = std::mem::replace(&mut self.1, crate::copystat::C::Submissions);
-        crate::copystat::add(c, self.0.elapsed().as_micros() as u64);
+        crate::copystat::add(c, self.0.nanos());
     }
 }
 

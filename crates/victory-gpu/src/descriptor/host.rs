@@ -631,6 +631,23 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// [`HostHeap::mirror`] for the title's own heap writes: most slots of
+    /// a written page hold the record they were made from (2,048 per page,
+    /// at every submission), and are left alone without the view looked up
+    /// and cloned.
+    pub(crate) fn sync(&self, index: u32, handle: u64) {
+        if index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
+            if tag == VIEW_TAG && made == key && super::view_is_current(i, generation) {
+                return;
+            }
+        }
+        self.mirror(index, handle, false);
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the

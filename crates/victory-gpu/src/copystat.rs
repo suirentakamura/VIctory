@@ -3,7 +3,7 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
 
-use std::collections::HashMap;
+use crate::fast::Map as HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -17,14 +17,14 @@ pub(crate) enum C {
     Skipped,
     SkippedBytes,
     Runs,
-    RunUs,
+    RunNs,
     Queries,
-    QueryUs,
-    MoveUs,
+    QueryNs,
+    MoveNs,
     Unmapped,
     /// Write-watch askings and their time.
     Watches,
-    WatchUs,
+    WatchNs,
     /// Bytes of watched ranges checked, and of those found unchanged.
     Checked,
     Unchanged,
@@ -40,15 +40,15 @@ pub(crate) enum C {
     /// Time in the kernel's write-watch answers, in the view check of the
     /// guard, in protecting; bytes and time of copies of memory neither
     /// watched nor guarded (copied whole).
-    KernelUs,
-    ViewQueryUs,
-    ProtectUs,
+    KernelNs,
+    ViewQueryNs,
+    ProtectNs,
     WholeBytes,
-    WholeUs,
+    WholeNs,
     /// Snapshots of ranges shaders write (bytes, time); page faults while
     /// preparing submissions and while copying back.
     SnapshotBytes,
-    SnapshotUs,
+    SnapshotNs,
     FaultsPrep,
     FaultsBack,
     /// Pages marked changed because a write landed on another mapping of
@@ -56,7 +56,7 @@ pub(crate) enum C {
     AliasMarks,
     /// Time in the guard handler; protection changes making pages read-only
     /// (calls, pages) and giving write access back (pages).
-    HandlerUs,
+    HandlerNs,
     ProtectCalls,
     ProtectPages,
     OpenPages,
@@ -66,32 +66,32 @@ pub(crate) enum C {
     WrittenAgain,
     /// In change checks: time asking the runtime for other mappings, and
     /// waiting for the guard lock.
-    AliasUs,
-    GuardWaitUs,
+    AliasNs,
+    GuardWaitNs,
     /// Preparing submissions: refresh batches done (copies and change
     /// checks); time in each kind of step (a step that flushes the batch
     /// counts that too); texture uploads for heaps; state preludes.
-    FlushUs,
-    StepRefreshUs,
-    StepCopyUs,
-    StepWorkUs,
-    StepGpuWriteUs,
-    StepTextureUs,
-    StepHeapUs,
-    StepMemoryUs,
-    UploadsUs,
-    PreludeUs,
+    FlushNs,
+    StepRefreshNs,
+    StepCopyNs,
+    StepWorkNs,
+    StepGpuWriteNs,
+    StepTextureNs,
+    StepHeapNs,
+    StepMemoryNs,
+    UploadsNs,
+    PreludeNs,
     /// Copying back: bytes of copies compared with their snapshots, and
     /// the time.
     CompareBytes,
-    CompareUs,
+    CompareNs,
     /// Copying back pages shaders marked as written through views: pages
     /// compared, bytes written back, the time; pages that kept the title's
     /// bytes (it wrote them, their bytes from before unknown); pages whose
     /// bytes the title's first write saved.
     MarkedPages,
     MarkedBytes,
-    MarkedUs,
+    MarkedNs,
     MarkedKept,
     SavedPages,
 }
@@ -120,7 +120,7 @@ static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(HashMap::default)
         .entry((src, len))
         .or_insert((0, 0, 0, kind));
     e.0 += 1;
@@ -136,7 +136,7 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
     *SNAPSHOTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(HashMap::default)
         .entry((start, len))
         .or_default() += bytes;
 }
@@ -212,7 +212,8 @@ pub(crate) fn log(frames: f64) {
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
     let mb = |v: f64| v / 1e6;
-    let ms = |v: f64| v / 1e3;
+    // Times are in nanoseconds.
+    let ms = |v: f64| v / 1e6;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
@@ -234,14 +235,14 @@ pub(crate) fn log(frames: f64) {
         c[C::Skipped as usize],
         mb(c[C::SkippedBytes as usize]),
         c[C::Runs as usize],
-        ms(c[C::RunUs as usize]),
+        ms(c[C::RunNs as usize]),
         c[C::Queries as usize],
-        ms(c[C::QueryUs as usize]),
-        ms(c[C::MoveUs as usize]),
+        ms(c[C::QueryNs as usize]),
+        ms(c[C::MoveNs as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
-        ms(c[C::WatchUs as usize]),
+        ms(c[C::WatchNs as usize]),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
@@ -249,39 +250,39 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-        ms(c[C::KernelUs as usize]),
-        ms(c[C::ViewQueryUs as usize]),
-        ms(c[C::ProtectUs as usize]),
+        ms(c[C::KernelNs as usize]),
+        ms(c[C::ViewQueryNs as usize]),
+        ms(c[C::ProtectNs as usize]),
         mb(c[C::WholeBytes as usize]),
-        ms(c[C::WholeUs as usize]),
+        ms(c[C::WholeNs as usize]),
         mb(c[C::SnapshotBytes as usize]),
-        ms(c[C::SnapshotUs as usize]),
+        ms(c[C::SnapshotNs as usize]),
         c[C::FaultsPrep as usize],
         c[C::FaultsBack as usize],
         c[C::AliasMarks as usize],
-        ms(c[C::HandlerUs as usize]),
+        ms(c[C::HandlerNs as usize]),
         c[C::ProtectCalls as usize],
         c[C::ProtectPages as usize],
         c[C::OpenPages as usize],
         c[C::WrittenPages as usize],
         c[C::WrittenAgain as usize],
-        ms(c[C::AliasUs as usize]),
-        ms(c[C::GuardWaitUs as usize]),
-        ms(c[C::FlushUs as usize]),
-        ms(c[C::StepRefreshUs as usize]),
-        ms(c[C::StepCopyUs as usize]),
-        ms(c[C::StepWorkUs as usize]),
-        ms(c[C::StepGpuWriteUs as usize]),
-        ms(c[C::StepTextureUs as usize]),
-        ms(c[C::StepHeapUs as usize]),
-        ms(c[C::StepMemoryUs as usize]),
-        ms(c[C::UploadsUs as usize]),
-        ms(c[C::PreludeUs as usize]),
+        ms(c[C::AliasNs as usize]),
+        ms(c[C::GuardWaitNs as usize]),
+        ms(c[C::FlushNs as usize]),
+        ms(c[C::StepRefreshNs as usize]),
+        ms(c[C::StepCopyNs as usize]),
+        ms(c[C::StepWorkNs as usize]),
+        ms(c[C::StepGpuWriteNs as usize]),
+        ms(c[C::StepTextureNs as usize]),
+        ms(c[C::StepHeapNs as usize]),
+        ms(c[C::StepMemoryNs as usize]),
+        ms(c[C::UploadsNs as usize]),
+        ms(c[C::PreludeNs as usize]),
         mb(c[C::CompareBytes as usize]),
-        ms(c[C::CompareUs as usize]),
+        ms(c[C::CompareNs as usize]),
         c[C::MarkedPages as usize],
         mb(c[C::MarkedBytes as usize]),
-        ms(c[C::MarkedUs as usize]),
+        ms(c[C::MarkedNs as usize]),
         c[C::MarkedKept as usize],
         c[C::SavedPages as usize],
         working_set() as f64 / 1e6,

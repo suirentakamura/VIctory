@@ -786,7 +786,8 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        let (d, s) = (dst as usize, src as usize);
+        list.defer(vec![(d, d + len), (s, s + len)], move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {

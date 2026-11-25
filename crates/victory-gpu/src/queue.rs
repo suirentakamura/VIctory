@@ -110,7 +110,8 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists (decision 0007); what follows their run is
+/// finished by the completion thread (`Host::execute`).
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -144,8 +145,8 @@ pub(crate) struct Plane {
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Signal with sync settings for the top and bottom of the pipe: as
+/// [`signal`].
 extern "system" fn signal2_x(
     this: This,
     fence: This,
@@ -157,9 +158,22 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// The fence takes `value` once the submissions before have run: at once
+/// with none in flight, else when the completion thread has finished the
+/// one in flight (holding the fence meanwhile).
 extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        crate::object::add_ref(fence);
+        let fence = fence as usize;
+        host.when_done(Box::new(move || {
+            crate::fence::signal(fence as This, value);
+            crate::fence::release(fence as This);
+        }));
+        return S_OK;
     }
     crate::fence::signal(fence, value)
 }

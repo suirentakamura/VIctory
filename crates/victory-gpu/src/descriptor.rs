@@ -182,7 +182,7 @@ pub(crate) fn sync_heaps() {
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
                 for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
+                    host.sync(index as u32, start + index * step);
                 }
             }
         }
@@ -440,6 +440,13 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+}
+
+/// Whether view record `i` is still of generation `generation`.
+#[cfg(windows)]
+fn view_is_current(i: u32, generation: u32) -> bool {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
 }
 
 /// The view of entry `i` if `generation` is still its own.

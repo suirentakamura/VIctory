@@ -32,7 +32,7 @@
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
 //! past that, the smallest copies read as missing (logged once).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast::{Map as HashMap, Set as HashSet};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -266,7 +266,7 @@ impl Shared {
             data: data as usize,
             gpu,
             null,
-            pairs: HashMap::new(),
+            pairs: HashMap::default(),
             generation: u64::MAX,
             layout: Arc::default(),
         })
@@ -330,6 +330,19 @@ fn layout(key: usize) -> Arc<Layout> {
         .find(|(k, _)| *k == key)
         .map(|(_, s)| s.layout.clone())
         .unwrap_or_default()
+}
+
+/// The title memory of every host copy view heap `key`'s page table names
+/// (address ranges): what shaders writing through it may change.
+pub(crate) fn title_ranges(key: usize) -> Vec<(usize, usize)> {
+    layout(key)
+        .copies
+        .iter()
+        .map(|c| {
+            let (start, len) = c.range();
+            (start as usize, (start + len) as usize)
+        })
+        .collect()
 }
 
 /// At submission, for a list using title memory with view heap `key`
