@@ -169,6 +169,34 @@ impl GraphicsState {
         }
     }
 
+    /// The blend description for the host. The console blends no integer
+    /// target (its hardware passes their values through, whatever the
+    /// state says); the host refuses a pipeline that enables blending on
+    /// one (vkd3d-proton: Grand Theft Auto VI's credits text, blended with
+    /// an `R8_UINT` third target). So blending is turned off for integer
+    /// targets, which is what the console does with them.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| crate::twin::integer(self.targets.RTFormats[i].0 as u32);
+        let on = |b: &D3D12_BLEND_DESC, i: usize| {
+            let t = if b.IndependentBlendEnable.as_bool() { i } else { 0 };
+            b.RenderTarget[t].BlendEnable.as_bool()
+        };
+        if !(0..count).any(|i| integer(i) && on(&blend, i)) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            // One description for all targets: each gets its own copy.
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -621,7 +649,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -726,7 +754,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
