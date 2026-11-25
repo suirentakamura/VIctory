@@ -1037,6 +1037,108 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// What [`cover`] did.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Covered {
+    /// Bytes of title memory newly given copies.
+    pub made: u64,
+    /// Bytes of the asked ranges that are not committed in the process:
+    /// nothing there to copy (a garbage pointer, a streamed-out page).
+    pub uncommitted: u64,
+    /// Bytes left uncovered because the budget was spent.
+    pub refused: u64,
+}
+
+/// The bytes of copies [`cover`] has made so far.
+static COVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The budget of [`cover`] in bytes: `VICTORY_MISS_WINDOWS_MB` megabytes in
+/// all, none (the default) turns it off.
+pub(crate) fn cover_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_MISS_WINDOWS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb << 20)
+    })
+}
+
+/// The bytes of copies [`cover`] has made so far.
+pub(crate) fn covered_total() -> u64 {
+    COVERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The runs of `[start, end)` committed in this process, and the bytes that
+/// are not (at most `queries` regions are asked about).
+fn committed_runs(start: u64, end: u64, mut queries: u32) -> (Vec<(u64, u64)>, u64) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (mut runs, mut gone) = (Vec::new(), 0u64);
+    let mut at = start;
+    while at < end {
+        if queries == 0 {
+            gone += end - at;
+            break;
+        }
+        queries -= 1;
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size; any address may be asked.
+        let n = unsafe { VirtualQuery(at as usize as *const _, &mut info, size_of_val(&info)) };
+        let base = info.BaseAddress as u64;
+        let next = base.saturating_add(info.RegionSize as u64);
+        if n == 0 || next <= at {
+            gone += end - at;
+            break;
+        }
+        let upto = next.min(end);
+        if info.State == MEM_COMMIT {
+            match runs.last_mut() {
+                Some((_, last)) if *last == at => *last = upto,
+                _ => runs.push((at, upto)),
+            }
+        } else {
+            gone += upto - at;
+        }
+        at = upto;
+    }
+    (runs, gone)
+}
+
+/// Gives the title memory shaders reached by address and no copy held (the
+/// page table's misses, `crate::memory`) copies: for each of `ranges` the
+/// committed parts, in the buffer copy that holds them or windows of
+/// [`WINDOW`], while the budget ([`cover_budget`]) lasts and at most `most`
+/// bytes are made. The page table names them from the next submission on.
+/// Memory the process has not committed is left alone: pointers computed
+/// from memory the title never built point everywhere.
+pub(crate) fn cover(ranges: &[(u64, u64)], most: u64) -> Covered {
+    let mut done = Covered::default();
+    let budget = cover_budget();
+    for &(start, end) in ranges {
+        let (runs, gone) = committed_runs(start, end, 4096);
+        done.uncommitted += gone;
+        for (a, b) in runs {
+            let mut at = a;
+            while at < b {
+                let upto = ((at & !(WINDOW - 1)) + WINDOW).min(b);
+                let spent = COVERED.load(std::sync::atomic::Ordering::Relaxed);
+                if spent + WINDOW > budget || done.made + WINDOW > most {
+                    done.refused += b - at;
+                    break;
+                }
+                let before = generation();
+                if find(at, upto - at).is_some() && generation() != before {
+                    COVERED.fetch_add(WINDOW, std::sync::atomic::Ordering::Relaxed);
+                    done.made += WINDOW;
+                }
+                at = upto;
+            }
+        }
+    }
+    done
+}
+
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
 /// `element` bytes, reads: the innermost title buffer's ([`find`]), unless
 /// the view does not start on an element of that copy. A host view counts
@@ -1260,6 +1362,30 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Only the committed part of a reserved range is a run; the rest is
+    /// counted as not there.
+    #[test]
+    fn committed_runs_skip_what_is_not_committed() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 4096;
+        // SAFETY: our own reservation, released at the end.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert!(!VirtualAlloc((p + PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let (runs, gone) = committed_runs(p as u64, (p + 3 * PAGE) as u64, 16);
+            assert_eq!(runs, vec![((p + PAGE) as u64, (p + 2 * PAGE) as u64)]);
+            assert_eq!(gone, 2 * PAGE as u64);
+            // Out of queries: what is left counts as gone.
+            let (runs, gone) = committed_runs(p as u64, (p + 3 * PAGE) as u64, 1);
+            assert!(runs.is_empty());
+            assert_eq!(gone, 3 * PAGE as u64);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.

@@ -144,6 +144,8 @@ struct Stats {
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
+    /// What covering the misses did ([`crate::shadow::cover`]).
+    covered: crate::shadow::Covered,
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -247,7 +249,8 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}); covered {:.1} MB of it with copies ({:.1} MB in all), \
+         {:.1} MB of it not committed, {:.1} MB over the budget",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -256,7 +259,11 @@ pub(crate) fn log_frame() {
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
-        missed.join(" ")
+        missed.join(" "),
+        s.covered.made as f64 / 1e6,
+        crate::shadow::covered_total() as f64 / 1e6,
+        s.covered.uncommitted as f64 / 1e6,
+        s.covered.refused as f64 / 1e6
     );
 }
 
@@ -484,6 +491,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        // Everything missed, as ranges, for [`crate::shadow::cover`].
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
@@ -495,6 +504,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    gaps.push(((entry as u64) << 28, ((entry as u64) << 28) + (1 << 28)));
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
@@ -504,6 +514,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     _ => {
                         pages += 1;
                         missed.push(at);
+                        gaps.push((at, at + (1 << 16)));
                     }
                 }
             }
@@ -529,7 +540,18 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             );
             written += 1;
         }
+        // Memory the title has committed that shaders reached with no copy
+        // gets one now (`VICTORY_MISS_WINDOWS_MB`), at most 256 MiB at a
+        // time: the lists after this one, and the next submission, find it.
+        let covered = if gaps.is_empty() || crate::shadow::cover_budget() == 0 {
+            crate::shadow::Covered::default()
+        } else {
+            crate::shadow::cover(&gaps, 256 << 20)
+        };
         stats(|s| {
+            s.covered.made += covered.made;
+            s.covered.uncommitted += covered.uncommitted;
+            s.covered.refused += covered.refused;
             s.written += written;
             s.withheld += withheld;
             s.missed_pages += pages;
