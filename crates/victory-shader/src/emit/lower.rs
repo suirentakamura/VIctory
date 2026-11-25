@@ -78,6 +78,9 @@ pub(crate) struct Parts<'a> {
     pub gs: Option<super::shader::Geometry>,
 }
 
+/// Emit site to the original LDS write sites and their channels, in write order.
+type GsOutputs = HashMap<Site, Vec<(Site, Vec<LdsOutput>)>>;
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -85,9 +88,10 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    let gs_outputs = gs_outputs_at_emit(parts)?;
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, gs_outputs.as_ref()).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -100,6 +104,72 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+/// In a straight-line GS, keep independent values for each GSVS ring slot
+/// until its vertex is emitted. DXIL's output registers hold one vertex.
+fn gs_outputs_at_emit(parts: &Parts) -> Result<Option<GsOutputs>, ShaderError> {
+    let [block] = parts.p.blocks.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(parts.native.stage, HwStage::Gs) || !matches!(block.exit, Exit::End) {
+        return Ok(None);
+    }
+    let writes: HashMap<_, _> = parts
+        .io
+        .lds_outputs
+        .iter()
+        .map(|(site, out)| (*site, out))
+        .collect();
+    let ops: HashMap<_, _> = parts.io.gs_ops.iter().copied().collect();
+    let mut pending = BTreeMap::new();
+    let mut at_emit = HashMap::new();
+    let mut next = 0;
+    let mut batched = false;
+    for i in 0..block.insts.len() {
+        let site = (0, i);
+        if let Some(outputs) = writes.get(&site) {
+            for &out in *outputs {
+                if out.vertex < next {
+                    return Err(ShaderError::Unsupported {
+                        offset: block.insts[i].machine.offset,
+                        what: "a GS ring write after its vertex was emitted",
+                    });
+                }
+                batched |= out.vertex > next;
+                pending
+                    .entry(out.vertex)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(site)
+                    .or_insert_with(Vec::new)
+                    .push(out);
+            }
+        }
+        if matches!(ops.get(&site), Some(GsOp::Emit(_) | GsOp::EmitCut(_))) {
+            let writes = pending.remove(&next).unwrap_or_default();
+            at_emit.insert(site, writes.into_iter().collect::<Vec<_>>());
+            next += 1;
+        }
+    }
+    if batched && let Some(first) = at_emit.values().next() {
+        // A batched emit must define its own outputs; registers from a
+        // previous emit cannot stand in for unwritten ring channels.
+        let channels = |writes: &[(Site, Vec<LdsOutput>)]| {
+            writes
+                .iter()
+                .flat_map(|(_, outputs)| outputs)
+                .map(|out| (out.row, out.channel))
+                .collect::<BTreeSet<_>>()
+        };
+        let first = channels(first);
+        if first.is_empty() || at_emit.values().any(|writes| channels(writes) != first) {
+            return Err(ShaderError::Unsupported {
+                offset: block.offset,
+                what: "different output channels in a batched GS ring",
+            });
+        }
+    }
+    Ok(batched.then_some(at_emit))
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -204,6 +274,7 @@ struct Lower<'a> {
     /// (both LDS on the console), and the stream messages.
     gs_reads: HashMap<Site, &'a [(u8, GsInput)]>,
     lds_outputs: HashMap<Site, &'a [LdsOutput]>,
+    gs_outputs: Option<&'a GsOutputs>,
     gs_ops: HashMap<Site, GsOp>,
     /// Merged geometry stages: the lane masks of the prologue that enables
     /// the wave's lanes with work ([`merged_wave_masks`]). Every host
@@ -543,7 +614,11 @@ fn merged_wave_masks(p: &Program) -> HashSet<Value> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        gs_outputs: Option<&'a GsOutputs>,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -705,6 +780,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|(s, o)| (*s, o.as_slice()))
                 .collect(),
+            gs_outputs,
             gs_ops: x.io.gs_ops.iter().copied().collect(),
             merged_wave_mask,
             handles: HashMap::new(),
@@ -3197,45 +3273,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(&writes) = self.lds_outputs.get(&(b, i)) {
-            // Dwords of rows the signature lacks are padding.
-            let mut stores = Vec::new();
-            for out in writes {
-                let found = self.s.outputs.iter().position(|o| {
-                    o.row == Some(u32::from(out.row))
-                        && out.channel >= o.col
-                        && out.channel < o.col + o.cols
-                });
-                let Some(id) = found else { continue };
-                if self.s.outputs[id].half {
-                    // shortcut: 16-bit outputs (as `export` packs them) are
-                    // not followed into LDS.
-                    return Err("a 16-bit output of a merged geometry stage");
-                }
-                let x = self.i32_of(out.value)?;
-                stores.push((id, out.channel - self.s.outputs[id].col, out.value, x));
+            if self.gs_outputs.is_some() {
+                return Ok(());
             }
-            let at = self.begin_guarded(guard);
-            for (id, col, value, x) in stores {
-                let el = &mut self.s.outputs[id];
-                el.usage |= 1 << col;
-                let (suffix, x) = match el.comp {
-                    9 => {
-                        let f = match self.floats.get(&value) {
-                            Some(&f) => f,
-                            None => self.as_float(x),
-                        };
-                        (".f32", f)
-                    }
-                    _ => (".i32", x),
-                };
-                let (id, zero) = (self.s.m.i32(id as u32), self.s.m.i32(0));
-                let args = [id, zero, self.s.m.i8(col), x];
-                let void = self.s.t.void;
-                let name = format!("storeOutput{suffix}");
-                self.s.op(self.cur, &name, Attr::NoUnwind, void, 5, &args);
-            }
-            self.end_guarded(at, &[]);
-            return Ok(());
+            return self.store_lds_outputs(writes, guard);
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
@@ -3499,6 +3540,48 @@ impl<'a> Lower<'a> {
 
     /// A geometry program's stream message: the vertex its output writes
     /// made is emitted, the strip cut.
+    fn store_lds_outputs(&mut self, writes: &[LdsOutput], guard: Option<V>) -> Result<(), Why> {
+        // Dwords of rows the signature lacks are padding.
+        let mut stores = Vec::new();
+        for out in writes {
+            let found = self.s.outputs.iter().position(|o| {
+                o.row == Some(u32::from(out.row))
+                    && out.channel >= o.col
+                    && out.channel < o.col + o.cols
+            });
+            let Some(id) = found else { continue };
+            if self.s.outputs[id].half {
+                // shortcut: 16-bit outputs (as `export` packs them) are
+                // not followed into LDS.
+                return Err("a 16-bit output of a merged geometry stage");
+            }
+            let x = self.i32_of(out.value)?;
+            stores.push((id, out.channel - self.s.outputs[id].col, out.value, x));
+        }
+        let at = self.begin_guarded(guard);
+        for (id, col, value, x) in stores {
+            let el = &mut self.s.outputs[id];
+            el.usage |= 1 << col;
+            let (suffix, x) = match el.comp {
+                9 => {
+                    let f = match self.floats.get(&value) {
+                        Some(&f) => f,
+                        None => self.as_float(x),
+                    };
+                    (".f32", f)
+                }
+                _ => (".i32", x),
+            };
+            let (id, zero) = (self.s.m.i32(id as u32), self.s.m.i32(0));
+            let args = [id, zero, self.s.m.i8(col), x];
+            let void = self.s.t.void;
+            let name = format!("storeOutput{suffix}");
+            self.s.op(self.cur, &name, Attr::NoUnwind, void, 5, &args);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     fn gs_op(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let (name, opcode, stream) = match self.gs_ops[&(b, i)] {
             GsOp::Emit(s) => ("emitStream", 97, s),
@@ -3512,6 +3595,16 @@ impl<'a> Lower<'a> {
             return Err("a geometry output stream other than 0");
         }
         let guard = self.guard(b, i)?;
+        if let Some(outputs) = self.gs_outputs.and_then(|plan| plan.get(&(b, i))) {
+            if guard.is_some() {
+                return Err("a lane-guarded emit from a batched GS ring");
+            }
+            for &((wb, wi), ref writes) in outputs {
+                // The original lane mask is part of the ring write.
+                let write_guard = self.guard(wb, wi)?;
+                self.store_lds_outputs(writes, write_guard)?;
+            }
+        }
         let at = self.begin_guarded(guard);
         let (stream, void) = (self.s.m.i8(0), self.s.t.void);
         self.s

@@ -1737,22 +1737,38 @@ mod tests {
                 (FourCC::OSG1, &position),
             ],
         );
-        let gs = translate(
-            HwStage::Gs,
-            28,
-            StageIo::Gs(GsIo {
-                outputs: vec![],
-                ring_dwords: 12,
-                invocations: 1,
-                max_vertices: 3,
-                vertex_dwords: 4,
-            }),
-            gs_words,
-            &[
-                (FourCC::ISG1, &part(element("SV_Position", 3), true)),
-                (FourCC::OSG1, &position),
-            ],
-        );
+        let geometry = |words: &[u32]| {
+            translate(
+                HwStage::Gs,
+                28,
+                StageIo::Gs(GsIo {
+                    outputs: vec![],
+                    ring_dwords: 12,
+                    invocations: 1,
+                    max_vertices: 3,
+                    vertex_dwords: 4,
+                }),
+                words,
+                &[
+                    (FourCC::ISG1, &part(element("SV_Position", 3), true)),
+                    (FourCC::OSG1, &position),
+                ],
+            )
+        };
+        // These words occur exactly at the three Emit instructions above.
+        // Keep the LDS writes and Cut unchanged, and move all Emits after the writes.
+        const EMIT: u32 = 0xBF90_0022;
+        let cut = gs_words.iter().position(|&w| w == 0xBF90_0012).unwrap();
+        assert_eq!(gs_words[..cut].iter().filter(|&&w| w == EMIT).count(), 3);
+        let batched_words: Vec<_> = gs_words[..cut]
+            .iter()
+            .copied()
+            .filter(|&w| w != EMIT)
+            .chain([EMIT; 3])
+            .chain(gs_words[cut..].iter().copied())
+            .collect();
+        let gs = geometry(gs_words);
+        let batched_gs = geometry(&batched_words);
         assert_eq!((es.stage, gs.stage), (HwStage::Es, HwStage::Gs));
         assert!(es.user_data.is_empty() && gs.user_data.is_empty());
         // A pixel shader writing ones.
@@ -1773,7 +1789,7 @@ mod tests {
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            for c in [&es.dxil, &gs.dxil, &ps] {
+            for c in [&es.dxil, &gs.dxil, &batched_gs.dxil, &ps] {
                 v.validate(&mut c.clone()).unwrap();
             }
         }
@@ -1803,6 +1819,13 @@ mod tests {
                 mesh_groups: 0,
             };
             let texels = host.draw(&root, &pso, &draw).unwrap();
+            let batched_pso = host.pipeline_gs(&root, &es.dxil, &batched_gs.dxil, &ps).unwrap();
+            let batched_texels = host.draw(&root, &batched_pso, &draw).unwrap();
+            eprintln!(
+                "warp {warp}: interleaved {} lit pixels, batched {} lit pixels",
+                texels.iter().filter(|&&t| t == [1.0; 4]).count(),
+                batched_texels.iter().filter(|&&t| t == [1.0; 4]).count()
+            );
             for (i, t) in texels.iter().enumerate() {
                 let (x, y) = ((i % 32) as f32, (i / 32) as f32);
                 let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
@@ -1812,6 +1835,7 @@ mod tests {
                 let want = if u + v < 0.0 { [1.0; 4] } else { [0.0; 4] };
                 assert_eq!(*t, want, "warp {warp} pixel ({x}, {y})");
             }
+            assert_eq!(batched_texels, texels, "warp {warp}, batched GS coverage");
         }
     }
 }
