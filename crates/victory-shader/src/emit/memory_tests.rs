@@ -241,9 +241,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[0x80 / 4] = 1.0f32.to_bits();
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
-    // Heap index 1 (the memory's view) has the title address.
-    let mut view_addresses = vec![0u32; 2 * 5];
-    view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    // Heap index 1 (the memory's view) has the title address: 8 descriptor
+    // dwords per index.
+    let mut view_addresses = vec![0u32; 8 * 5];
+    view_addresses[8..10].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {

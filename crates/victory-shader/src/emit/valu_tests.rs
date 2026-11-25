@@ -1747,3 +1747,40 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 0x00F): the f64 in root constants 0-1.
+    let one = 1.0f64.to_bits();
+    let cases: &[u64] = &[
+        one,
+        (-2.5f64).to_bits(),
+        0.1f64.to_bits(),
+        one + (1 << 28),     // 1 + 2^-24: a tie, down to even
+        one + (3 << 28),     // 1 + 3 * 2^-24: a tie, up to even
+        one + (1 << 28) + 1, // just above the tie: up
+        f64::from(f32::MAX).to_bits(),
+        f64::from(f32::MAX).to_bits() + (1 << 28), // a tie past the largest: infinity
+        1e40f64.to_bits(),
+        (-1e40f64).to_bits(),
+        1e-40f64.to_bits(), // an f32 denormal
+        f64::from(f32::from_bits(1)).to_bits() / 2 * 3, // around the smallest denormal
+        1e-50f64.to_bits(),
+        (-0.0f64).to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        f64::NAN.to_bits(),
+        123_456_789.123_456_789f64.to_bits(),
+    ];
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&b| [b as u32, (b >> 32) as u32, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let x = f64::from_bits(cases[i]);
+        let want = (x as f32).to_bits();
+        if x.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: NaN gave {got:#010x}");
+        } else {
+            assert_eq!(got, want, "{backend}: v_cvt_f32_f64({x:e}) = {got:#010x}, want {want:#010x}");
+        }
+    });
+}

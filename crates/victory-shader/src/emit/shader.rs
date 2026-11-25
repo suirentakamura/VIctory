@@ -49,6 +49,7 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -369,8 +370,8 @@ impl Shader {
     }
 
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
-    /// buffer: per resource-heap index, a buffer view's title address as a
-    /// buffer descriptor's dwords 0 and 1), made in the entry block.
+    /// buffer: per resource-heap index, the view's 8 descriptor dwords as
+    /// the console's), made in the entry block.
     pub fn view_addresses_handle(&mut self) -> V {
         if let Some(h) = self.view_addresses {
             return h;
@@ -893,6 +894,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

@@ -140,11 +140,13 @@
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
-//! * **View addresses** ([`HostShader::view_addresses`]): a buffer
-//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
-//!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
-//!   index, two dwords, the buffer view's title address (high dword bits
-//!   0-15; stride bits 0), zeros for no buffer view.
+//! * **View addresses** ([`HostShader::view_addresses`]): descriptor
+//!   dwords read as numbers (the BVH SRV's base address, a texture's size
+//!   for `GetDimensions`) come from the root SRV `t1` in [`MEMORY_SPACE`]:
+//!   per resource-heap index, eight dwords, the view as the console's
+//!   descriptor (a buffer's address, stride and records; an image's
+//!   address, size, mip and array range, type and swizzle), zeros for an
+//!   empty slot.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap

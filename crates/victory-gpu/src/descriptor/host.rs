@@ -50,10 +50,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
+    /// Per title slot, the view it holds as the console's eight descriptor
+    /// dwords (shaders reading a descriptor's address or size as data,
+    /// `crate::memory`): the buffer, its mapping and host address, made on
+    /// first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -541,13 +541,13 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 32)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
+                write_words(data, i, view.as_ref());
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -559,7 +559,7 @@ impl HostHeap {
     /// Slot `index` now holds `view` (or no view): its view address.
     fn note_address(&self, index: u32, view: Option<&View>) {
         if let Some(Some((_, data, _))) = self.addresses.get() {
-            write_address(*data, index as usize, view);
+            write_words(*data, index as usize, view);
         }
     }
 
@@ -803,14 +803,152 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
-fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+/// Writes slot `index`'s descriptor words into the view addresses at
+/// `data`: the 8 dwords the console's descriptor would hold, for programs
+/// that read them as numbers (a view's address, a texture's size).
+fn write_words(data: usize, index: usize, view: Option<&View>) {
+    let words = view.map_or([0; 8], console_words);
+    // SAFETY: the mapped view addresses hold 32 bytes per title slot.
+    unsafe { ((data + 32 * index) as *mut [u32; 8]).write_unaligned(words) };
+}
+
+/// A view as the console's GFX10 descriptor: a buffer's (base address,
+/// stride, records) or an image's (address, size, mip and array range,
+/// type, swizzle).
+// shortcut: no data format, tiling, LOD clamp or compression fields (read
+// as 0); programs read sizes and addresses.
+fn console_words(view: &View) -> [u32; 8] {
+    let mut w = [0u32; 8];
+    // Identity swizzle: X, Y, Z, W.
+    const IDENTITY: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    if let Some((address, len)) = buffer_range(view) {
+        let raw = buffer_raw(view);
+        let element = u64::from(view_stride(view).max(1));
+        let (stride, records) = if raw { (0, len) } else { (element, len / element) };
+        w[0] = address as u32;
+        w[1] = (address >> 32) as u32 & 0xFFFF | (stride as u32 & 0x3FFF) << 16;
+        w[2] = records.min(u64::from(u32::MAX)) as u32;
+        w[3] = IDENTITY;
+        return w;
+    }
+    // The texture, the view's words (none: the whole resource) and where
+    // its union starts (shader views: word 4; unordered: word 2).
+    let (shape, desc, unordered) = match view {
+        View::Shader(r, desc) => (crate::resource::texture_shape(*r as crate::object::This), *desc, false),
+        View::Unordered(r, _, desc) => (crate::resource::texture_shape(*r as crate::object::This), *desc, true),
+        View::Placed(unordered, resource, desc) => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: Option<[u32; 10]> = desc[..10].try_into().ok();
+            (crate::resource::placed_shape(address, resource), words, *unordered)
+        }
+        _ => return w,
+    };
+    let Some(t) = shape else { return w };
+    let arrays = t.dimension != 4;
+    let layers = if arrays { t.depth_or_array_size.max(1) } else { 1 };
+    let mips = t.mip_levels.max(1);
+    // (view dimension, first mip, mip count, first layer, layer count, swizzle)
+    let (dim, first_mip, mip_count, first, count, swizzle) = match desc {
+        None => {
+            let dim = match (t.dimension, layers > 1, t.samples > 1) {
+                (2, false, _) => 2,
+                (2, true, _) => 3,
+                (3, false, false) => 4,
+                (3, true, false) => 5,
+                (3, false, true) => 6,
+                (3, true, true) => 7,
+                _ => 8,
+            };
+            (dim, 0, mips, 0, layers, IDENTITY)
+        }
+        Some(d) if unordered => {
+            let u = &d[2..];
+            // (mip slice, first layer, layer count) per dimension.
+            let (mip, first, count) = match d[1] {
+                3 | 5 => (u[0], u[1], u[2]),
+                7 => (0, u[0], u[1]),
+                6 => (0, 0, 1),
+                _ => (u[0], 0, layers),
+            };
+            (d[1], mip, 1, first, count, IDENTITY)
+        }
+        Some(d) => {
+            let u = &d[4..];
+            let (mip, levels, first, count) = match d[1] {
+                3 | 5 => (u[0], u[1], u[2], u[3]),
+                // Cubes: first face, cubes of 6 faces.
+                10 => (u[0], u[1], u[2], u[3].saturating_mul(6)),
+                9 => (u[0], u[1], 0, 6),
+                7 => (0, 1, u[0], u[1]),
+                6 => (0, 1, 0, 1),
+                _ => (u[0], u[1], 0, layers),
+            };
+            let levels = if levels == u32::MAX { mips.saturating_sub(mip) } else { levels };
+            // D3D's mapping (3 bits per channel: 0-3 a component, 4 zero,
+            // 5 one) as the console's selects (0 zero, 1 one, 4-7 X-W).
+            let map = d[2];
+            let sel = |c: u32| match map >> (3 * c) & 7 {
+                v @ 0..=3 => 4 + v,
+                4 => 0,
+                _ => 1,
+            };
+            let swizzle = sel(0) | sel(1) << 3 | sel(2) << 6 | sel(3) << 9;
+            (d[1], mip, levels.max(1), first, count, swizzle)
+        }
+    };
+    // The console's image types: 1D, 2D, 3D, cube, 1D array, 2D array, 2D
+    // multisampled, 2D multisampled array.
+    let kind = match dim {
+        2 => 8,
+        3 => 12,
+        4 => 9,
+        5 => 13,
+        6 => 14,
+        7 => 15,
+        8 => 10,
+        _ => 11,
+    };
+    // 3D: the depth; arrays and cubes: the last layer (from the first).
+    let depth = if dim == 8 {
+        t.depth_or_array_size.max(1) - 1
+    } else {
+        (first + count.max(1)).saturating_sub(1)
+    };
+    let (width, height) = ((t.width.max(1) - 1) as u32, t.height.max(1) - 1);
+    let base = t.address >> 8;
+    w[0] = base as u32;
+    w[1] = (base >> 32) as u32 & 0xFF | (width & 3) << 30;
+    w[2] = (width >> 2) & 0x3FFF | (height & 0xFFFF) << 14 | 1 << 31;
+    let last = (first_mip + mip_count - 1).min(15);
+    w[3] = swizzle | (first_mip & 15) << 12 | last << 16 | kind << 28;
+    w[4] = depth & 0x1FFF | (if dim == 8 { 0 } else { first & 0x1FFF }) << 16;
+    w[5] = (mips - 1).min(15) << 8;
+    w
+}
+
+/// Whether a buffer view is raw (byte-addressed: no stride on the console).
+fn buffer_raw(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return true,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, _, desc) => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: as above.
+        let b = unsafe { desc.Anonymous.Buffer };
+        b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
