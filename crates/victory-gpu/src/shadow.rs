@@ -255,7 +255,7 @@ impl Shadow {
     ///
     /// `marked`: the shaders mark the pages they write through this copy's
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
-    /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
+    /// the pages they marked are compared ([`copy_back_marks`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
@@ -459,58 +459,58 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    ///
+    /// This is the first part, on the completion thread: the page's plan,
+    /// or None when nothing goes back ([`copy_back_marks`] puts the planned
+    /// pages back on several threads, [`Shadow::put_back`]).
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
-        let written = self.marked_back(page);
-        // A submission prepared while this one ran may have armed the page
-        // too (unarmed above): armed again while ranges are pending there.
-        if let Some(t) = &self.tracked
-            && self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|&(_, a, e)| a < page + PAGE && e > page)
-        {
-            t.arm(page, page + PAGE);
-        }
-        written
-    }
-
-    /// [`Shadow::copy_back_marked`] of the page.
-    fn marked_back(&self, page: usize) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
+    fn plan_marked(self: &Arc<Self>, page: usize) -> Option<Marked> {
+        let t = self.tracked.as_ref()?;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
-            return 0;
+            return None;
         }
-        // Our own write below must not save the page for this copy again.
+        // Our own write must not save the page for this copy again.
         t.unarm(page / PAGE);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
+            return None;
         }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
+        Some(Marked {
+            copy: self.clone(),
+            page,
+            from,
+            to,
+            saved,
+        })
+    }
+
+    /// Puts a planned page back ([`Shadow::plan_marked`]) while its title
+    /// memory is open ([`crate::watch::writing_runs`]), reading title memory
+    /// into `title`: the bytes written, None if title memory could not be
+    /// read (nothing changed then).
+    fn put_back(&self, m: &Marked, title: &mut Vec<u8>) -> Option<usize> {
+        let n = m.to - m.from;
+        // SAFETY: inside the mapping; the GPU is done with it, and each page
+        // of a copy is put back by one thread while nothing else writes the
+        // copy (the submission's refreshes wait for the copy-back).
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(m.from - self.start as usize), n) };
+        title.resize(n, 0);
+        let title = &mut title[..n];
+        if !crate::host::read_into(m.from as *const u8, title) {
+            return None;
         }
-        let written = match &saved {
+        let written = match &m.saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => (*host != *title).then_some(host.as_ptr()),
             Some(before) => {
-                let before = &before[from - page..to - page];
+                let before = &before[m.from - m.page..m.to - m.page];
                 let mut changed = false;
                 for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
                     if *h != *b && *t != *h {
@@ -523,14 +523,20 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            crate::host::write_mapped(m.from as *mut u8, bytes, n);
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-        }
-        written.map_or(0, |_| n)
+        Some(written.map_or(0, |_| n))
+    }
+
+    /// Whether the copy's bytes of a page put back still equal title memory
+    /// (read into `title`); true where title memory cannot be read.
+    fn still_equal(&self, m: &Marked, title: &mut Vec<u8>) -> bool {
+        let n = m.to - m.from;
+        // SAFETY: inside the mapping; nothing writes the copy meanwhile.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(m.from - self.start as usize), n) };
+        title.resize(n, 0);
+        let title = &mut title[..n];
+        !crate::host::read_into(m.from as *const u8, title) || *host == *title
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -780,10 +786,18 @@ pub(crate) fn view_writes() -> Option<u64> {
 }
 
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
+/// views goes back ([`Shadow::plan_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared); the bitmap is cleared. Before the copy-backs of
 /// declared ranges, which disarm the copies.
+///
+/// In one pass (about 2,500 pages per cinematic frame, 48 ms page by page in
+/// play85, while the GPU and the next submission's refreshes waited): the
+/// pages are planned here, opened at once (a protection change per run of
+/// pages, [`crate::watch::writing_runs`]), put back on the copy workers
+/// ([`crate::pool`]), and taken again per copy; then each page taken is
+/// compared with title memory once more, since a title write while it was
+/// open did not fault (such a page is changed after all).
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
@@ -826,22 +840,135 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             })
             .collect()
     };
-    for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
+    let pages: Vec<(Arc<Shadow>, usize)> = pages
+        .into_iter()
+        .filter(|(copy, page)| {
+            !withheld
+                .iter()
+                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && *page < a + n)
+        })
+        .collect();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::MarkedPages, pages.len() as u64);
+    let mut plans: Vec<Marked> = pages.iter().filter_map(|(copy, page)| copy.plan_marked(*page)).collect();
+    // By title page: a page that several copies show is put back by one
+    // thread, copy after copy (each merges into what the one before wrote).
+    plans.sort_unstable_by_key(|m| (m.page, Arc::as_ptr(&m.copy) as usize));
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, m) in plans.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if plans[g.start].page == m.page => g.end = i + 1,
+            _ => groups.push(i..i + 1),
+        }
+    }
+    // A page that several copies hold: the copies after the first merge
+    // against what the title's page held before any of them was put back
+    // (the first's write used to save it for them, while they were armed).
+    for g in groups.iter().filter(|g| g.len() > 1) {
+        if plans[g.clone()].iter().skip(1).all(|m| m.saved.is_some()) {
             continue;
         }
-        let written = copy.copy_back_marked(page);
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+        let mut before = vec![0u8; PAGE].into_boxed_slice();
+        if crate::host::read_into(plans[g.start].page as *const u8, &mut before) {
+            for m in &mut plans[g.start + 1..g.end] {
+                if m.saved.is_none() {
+                    m.saved = Some(before.clone());
+                }
+            }
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
     }
+    const UNREAD: usize = usize::MAX;
+    let results: Vec<std::sync::atomic::AtomicUsize> =
+        plans.iter().map(|_| std::sync::atomic::AtomicUsize::new(UNREAD)).collect();
+    {
+        // Every page open at once (a protection change per run), put back
+        // on the copy workers, guarded again below.
+        let ranges: Vec<(usize, usize)> = plans.iter().map(|m| (m.from, m.to)).collect();
+        let _open = crate::watch::writing_runs(&ranges);
+        crate::pool::for_each(groups.len(), &|g| {
+            with_buffer(|title| {
+                for i in groups[g].clone() {
+                    if let Some(written) = plans[i].copy.put_back(&plans[i], title) {
+                        results[i].store(written, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        });
+    }
+    // Pages put back whole equal title memory: taken (and guarded) again,
+    // per copy in one go, so that our write is not taken for the title's.
+    let mut taken: crate::fast::Map<usize, (&Arc<Shadow>, Vec<usize>)> = Default::default();
+    let mut check = Vec::new();
+    for (i, m) in plans.iter().enumerate() {
+        let written = results[i].load(std::sync::atomic::Ordering::Relaxed);
+        if written == UNREAD {
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+        if m.from == m.page && m.to == m.page + PAGE {
+            taken
+                .entry(Arc::as_ptr(&m.copy) as usize)
+                .or_insert_with(|| (&m.copy, Vec::new()))
+                .1
+                .push(m.page / PAGE);
+            check.push(i);
+        }
+    }
+    for (copy, pages) in taken.values() {
+        if let Some(t) = &copy.tracked {
+            t.taken(pages);
+        }
+    }
+    // A submission prepared while this one ran may have armed a page too
+    // (unarmed above): armed again while ranges are pending there.
+    for (copy, page) in &pages {
+        if let Some(t) = &copy.tracked
+            && copy
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|&(_, a, e)| a < page + PAGE && e > *page)
+        {
+            t.arm(*page, page + PAGE);
+        }
+    }
+    // A title write while the pages were open did not fault: such a page is
+    // changed after all (the copy holds what it had before).
+    crate::pool::for_each(check.len(), &|k| {
+        let m = &plans[check[k]];
+        if !with_buffer(|title| m.copy.still_equal(m, title))
+            && let Some(t) = &m.copy.tracked
+        {
+            t.mark_changed(m.page / PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MarkedRaced, 1);
+        }
+    });
+}
+
+/// A marked page to put back ([`copy_back_marks`]).
+struct Marked {
+    copy: Arc<Shadow>,
+    /// The title page and the part of it the copy holds.
+    page: usize,
+    from: usize,
+    to: usize,
+    /// What the page held when the title first wrote it, if it did.
+    saved: Option<Box<[u8]>>,
+}
+
+/// Runs `f` with this thread's page buffer (kept: a fresh 64 KiB buffer
+/// per page cost an allocation and its page faults).
+fn with_buffer<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUFFER.with(|b| match b.try_borrow_mut() {
+        Ok(mut b) => f(&mut b),
+        Err(_) => f(&mut Vec::new()),
+    })
 }
 
 struct Entry {
