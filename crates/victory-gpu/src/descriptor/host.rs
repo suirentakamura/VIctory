@@ -644,12 +644,24 @@ impl HostHeap {
                         // SAFETY: the handle is a descriptor slot in title
                         // memory.
                         let [tag, i, generation] = unsafe { (handle(index) as *const [u32; 3]).read_unaligned() };
+                        let made = made[index as usize];
+                        if tag != VIEW_TAG {
+                            // No view of ours: `mirror` only has to clear a
+                            // slot made before. Most slots of a written page
+                            // are this (never written, or the title's own
+                            // data), and sending them all to `mirror` took
+                            // two locks each: 77 ms a frame over ~960,000
+                            // slots in the world (play90).
+                            return made != 0;
+                        }
                         let key = u64::from(generation) << 32 | u64::from(i);
-                        !(tag == VIEW_TAG && made[index as usize] == key && current(i, generation))
+                        !(made == key && current(i, generation))
                     })
                     .collect()
             })
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncMade, stale.len() as u64);
         for index in stale.into_iter().chain(inside.max(first)..last) {
             self.mirror(index, handle(index), false);
         }
