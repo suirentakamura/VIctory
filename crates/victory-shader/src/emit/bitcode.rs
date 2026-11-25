@@ -528,6 +528,86 @@ impl Module {
         live
     }
 
+    /// Gives every loop header with more than one back edge a single latch,
+    /// as LLVM's loop simplification leaves DXC's loops: the back edges
+    /// branch to a new block that branches to the header, and the header's
+    /// phis take their values through phis there. vkd3d-proton's
+    /// structurizer (dxil-spirv) recurses without end building dominators
+    /// for some headers with several back edges.
+    pub fn single_latches(&mut self) {
+        let succs = |m: &Module, b: usize| successors(m.blocks[b].term);
+        let mut pos = vec![usize::MAX; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        pos[0] = 0;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(self, b).get(k) {
+                Some(&s) if pos[s] == usize::MAX => {
+                    pos[s] = 0;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n;
+        }
+        // Back edges by header, in layout order.
+        let mut back: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut headers = Vec::new();
+        for &b in &post {
+            for &s in succs(self, b).iter() {
+                if pos[s] <= pos[b] {
+                    let from = back.entry(s).or_default();
+                    if from.is_empty() {
+                        headers.push(s);
+                    }
+                    if !from.contains(&b) {
+                        from.push(b);
+                    }
+                }
+            }
+        }
+        for h in headers {
+            let from = &back[&h];
+            if from.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &p in from {
+                self.blocks[p].term = match self.blocks[p].term {
+                    Some(Term::Br(t)) if t == h => Some(Term::Br(latch)),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(
+                        c,
+                        if t == h { latch } else { t },
+                        if f == h { latch } else { f },
+                    )),
+                    t => t,
+                };
+            }
+            for i in self.blocks[h].phis.clone() {
+                let Op::Phi(incoming) = &self.insts[i as usize].op else {
+                    unreachable!("a phi")
+                };
+                let (late, mut early): (Vec<_>, Vec<_>) =
+                    incoming.iter().copied().partition(|(_, b)| from.contains(b));
+                let ty = self.insts[i as usize].ty;
+                let merged = self.phi(latch, ty);
+                self.set_phi(merged, late);
+                early.push((merged, latch));
+                self.set_phi(V::Inst(i), early);
+            }
+            self.terminate(latch, Term::Br(h));
+        }
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -1211,6 +1291,47 @@ mod tests {
             m.write()
         };
         assert_eq!(build(false), build(true));
+    }
+
+    #[test]
+    fn back_edges_share_one_latch() {
+        // head: i = phi [0, entry], [a, left], [b, right]; two back edges.
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [entry, head, left, right, exit] = [(); 5].map(|_| m.new_block());
+        let (z, one, two, ten) = (m.i32(0), m.i32(1), m.i32(2), m.i32(10));
+        m.terminate(entry, Term::Br(head));
+        let i = m.phi(head, i32t);
+        let odd = m.cmp(head, pred::EQ, i, one);
+        m.terminate(head, Term::CondBr(odd, left, right));
+        let a = m.bin(left, Bin::Add, i, one);
+        m.terminate(left, Term::Br(head));
+        let b = m.bin(right, Bin::Add, i, two);
+        let more = m.cmp(right, pred::IULT, b, ten);
+        m.terminate(right, Term::CondBr(more, head, exit));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(i, vec![(z, entry), (a, left), (b, right)]);
+
+        m.single_latches();
+        let latch = m.blocks.len() - 1;
+        assert!(matches!(m.blocks[left].term, Some(Term::Br(l)) if l == latch));
+        assert!(matches!(m.blocks[right].term, Some(Term::CondBr(_, l, e)) if l == latch && e == exit));
+        assert!(matches!(m.blocks[latch].term, Some(Term::Br(h)) if h == head));
+        let Op::Phi(into_head) = &m.insts[match i { V::Inst(i) => i as usize, _ => unreachable!() }].op else {
+            panic!()
+        };
+        let [(v0, b0), (merged, b1)] = into_head[..] else { panic!("{into_head:?}") };
+        assert_eq!((v0, b0, b1), (z, entry, latch));
+        let V::Inst(merged) = merged else { panic!() };
+        let Op::Phi(into_latch) = &m.insts[merged as usize].op else { panic!() };
+        assert_eq!(into_latch[..], [(a, left), (b, right)]);
+        // A loop with one back edge is left alone.
+        let blocks = m.blocks.len();
+        m.single_latches();
+        assert_eq!(m.blocks.len(), blocks);
     }
 
     #[test]
