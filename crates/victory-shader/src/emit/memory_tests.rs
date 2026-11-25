@@ -179,6 +179,7 @@ fn program() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        loop_report: None,
         view_marks: false,
         gs: None,
     })
@@ -407,6 +408,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        loop_report: None,
         view_marks: false,
         gs: None,
     })
@@ -550,6 +552,7 @@ fn writes_through_views_mark_their_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        loop_report: None,
         view_marks: true,
         gs: None,
     })

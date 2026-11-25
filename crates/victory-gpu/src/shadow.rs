@@ -715,7 +715,7 @@ impl Marks {
             }
             return Some(at);
         }
-        if self.end + n < victory_shader::emit::VIEW_WRITE_BITS {
+        if self.end + n < victory_shader::emit::MARK_BITS {
             self.end += n;
             return Some(self.end - n);
         }
@@ -799,6 +799,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
     // Marks of offsets past the bitmap land in its last bit, no copy's.
     bits[words - 1] = 0;
+    #[cfg(feature = "diagnostics")]
+    if victory_shader::emit::loop_report() {
+        report_loops(bits);
+    }
     let mut marked = Vec::new();
     let used = (marks().end as usize).div_ceil(32).min(words);
     for (w, word) in bits[..used].iter_mut().enumerate() {
@@ -1223,5 +1227,39 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+}
+
+/// Diagnostics (`VICTORY_SHADER_LOOP_REPORT`): the loops lanes left at the
+/// limit in the last submission, from the report table the programs counted
+/// in (`victory_shader::emit::loop_report`); the table is cleared. Logged
+/// per loop the first time and then whenever its total passes a power of two.
+#[cfg(feature = "diagnostics")]
+fn report_loops(bits: &mut [u32]) {
+    use victory_shader::emit::{LOOP_REPORT_SLOTS, LOOP_REPORT_WORD};
+    static TOTALS: Mutex<BTreeMap<(u32, u32), u64>> = Mutex::new(BTreeMap::new());
+    let first = LOOP_REPORT_WORD as usize;
+    for slot in 0..LOOP_REPORT_SLOTS as usize {
+        let at = first + 3 * slot;
+        let [id, offset, lanes] = [bits[at], bits[at + 1], bits[at + 2]];
+        bits[at..at + 3].fill(0);
+        if lanes == 0 {
+            continue;
+        }
+        let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        let total = totals.entry((id, offset)).or_insert(0);
+        let before = *total;
+        *total += u64::from(lanes);
+        if before == 0 || total.ilog2() > before.ilog2() {
+            let hash = crate::shader_cache::report_name(id);
+            tracing::warn!(
+                program = id,
+                shader = hash.as_deref().unwrap_or("?"),
+                loop_at = format_args!("{offset:#x}"),
+                lanes,
+                total = *total,
+                "lanes stopped by the loop limit"
+            );
+        }
     }
 }

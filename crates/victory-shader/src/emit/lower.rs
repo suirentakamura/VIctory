@@ -82,6 +82,9 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// A lane stopped by the loop limit reports it under this id
+    /// ([`super::loop_report`]).
+    pub loop_report: Option<u32>,
     /// Geometry: what the shader declares (its primitives and limits).
     pub gs: Option<super::shader::Geometry>,
 }
@@ -10161,12 +10164,53 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         let limit = self.s.m.i32(super::loop_limit());
+        if let Some(id) = self.x.loop_report {
+            // The report may end the block: the edge leaves the last one.
+            let hit = self.s.m.cmp(c, pred::IUGE, next, limit);
+            let offset = self.x.p.blocks[to].offset as u32;
+            self.report_loop(hit, id, offset);
+        }
+        let c = self.cur;
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// Diagnostics ([`super::loop_report`]): the lanes of `hit` count
+    /// themselves in the slot of the loop at `offset` of program `id`, and
+    /// leave the program's id and the offset there. Without write marks (no
+    /// bitmap) nothing. May end in a new block.
+    fn report_loop(&mut self, hit: V, id: u32, offset: u32) {
+        let slot = super::loop_report_slot(id, offset);
+        let at = (super::LOOP_REPORT_WORD + 3 * slot) * 4;
+        let bitmap = self.s.view_writes_handle();
+        let outer = self.begin_guarded(Some(hit));
+        let c = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (word, id_v, offset_v, one) = (
+            self.s.m.i32(at),
+            self.s.m.i32(id),
+            self.s.m.i32(offset),
+            self.s.m.i32(1),
+        );
+        let second = self.s.m.i32(at + 4);
+        let third = self.s.m.i32(at + 8);
+        // Operations: 0 add, 8 exchange.
+        for (op, byte, value) in [(8, word, id_v), (8, second, offset_v), (0, third, one)] {
+            let op = self.s.m.i32(op);
+            self.s.op(
+                c,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                78,
+                &[bitmap, op, byte, iu, iu, value],
+            );
+        }
+        self.end_guarded(outer, &[]);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -10662,6 +10706,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
             view_marks: false,
             gs: None,
         })
@@ -10714,6 +10759,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
             view_marks: false,
             gs: None,
         })
@@ -10768,6 +10814,82 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    /// A one-thread loop of `s0` rounds, lowered with the loop report on
+    /// or off.
+    fn lower_loop(report: Option<u32>) -> Lowered {
+        let words = [
+            0xBE86_0380u32, // s_mov_b32 s6, 0
+            0x8106_8106,    // loop: s_add_i32 s6, s6, 1
+            0xBF0A_0006,    // s_cmp_lt_u32 s6, s0
+            0xBF85_FFFD,    // s_cbranch_scc1 loop
+            0x7E00_0206,    // v_mov_b32 v0, s6
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,    // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let constants = RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![constants, root(RootType::Table, 4, 1)],
+            used: vec![buffer],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            loop_report: report,
+            view_marks: false,
+            gs: None,
+        })
+        .expect("a loop lowers")
+    }
+
+    #[test]
+    fn a_loop_reports_the_lanes_the_limit_stops_in_the_written_pages_bitmap() {
+        let plain = lower_loop(None);
+        assert!(!plain.view_marks, "no bitmap without the report");
+        let reporting = lower_loop(Some(0x1234_5678));
+        assert!(reporting.view_marks, "the report counts in the bitmap");
+        assert!(reporting.dxil.len() > plain.dxil.len());
+        let slot = crate::emit::loop_report_slot(0x1234_5678, 4);
+        assert!(slot < crate::emit::LOOP_REPORT_SLOTS);
+        assert!(crate::emit::MARK_BITS < crate::emit::VIEW_WRITE_BITS);
     }
 
     #[test]
@@ -10905,6 +11027,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
             view_marks: false,
             gs: None,
         })
@@ -11511,6 +11634,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                loop_report: None,
                 view_marks: false,
                 gs: None,
             });

@@ -263,6 +263,47 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether a lane stopped by the loop limit reports it (diagnostics builds
+/// with `VICTORY_SHADER_LOOP_REPORT` set, in programs translated with
+/// [`Options::view_marks`], which the runtime always does). Its program
+/// adds 1 to the count of a slot of the table at [`LOOP_REPORT_WORD`] of the
+/// written-pages bitmap and stores the program's [`loop_report_id`] and the
+/// loop header's code offset in the slot, for the host to log
+/// (`victory_gpu::shadow`). Part of the translation, so the shader cache
+/// keys on it ([`loop_limit`] is hashed with it).
+pub fn loop_report() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_SHADER_LOOP_REPORT").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// The slots of the loop report table: three dwords each (program id, loop
+/// offset, lanes stopped).
+pub const LOOP_REPORT_SLOTS: u32 = 64;
+
+/// The first dword of the loop report table in the written-pages bitmap
+/// ([`VIEW_WRITE_BITS`]), just below the last dword (which takes the marks
+/// of offsets past the bitmap). The host hands out marks only below it.
+pub const LOOP_REPORT_WORD: u32 = VIEW_WRITE_BITS / 32 - 1 - 3 * LOOP_REPORT_SLOTS;
+
+/// The bits of the written-pages bitmap marks are handed out from.
+pub const MARK_BITS: u32 = LOOP_REPORT_WORD * 32;
+
+/// The id a program reports a stopped loop under: the first dword of its
+/// container's digest.
+pub fn loop_report_id(container: &[u8]) -> u32 {
+    container
+        .get(4..8)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+}
+
+/// The slot of a loop (program id, header offset) in the report table.
+pub fn loop_report_slot(id: u32, offset: u32) -> u32 {
+    (id ^ offset.wrapping_mul(0x9E37_79B1)).wrapping_mul(0x85EB_CA6B) >> 26
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -535,6 +576,8 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        loop_report: (options.view_marks && loop_report())
+            .then(|| u32::from_le_bytes(c.digest[..4].try_into().expect("4 bytes"))),
         gs,
     };
     let l = match lower::lower(&parts(st, res)) {
