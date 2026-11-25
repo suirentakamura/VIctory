@@ -33,6 +33,8 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+mod helper;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
