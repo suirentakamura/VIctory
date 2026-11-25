@@ -65,12 +65,14 @@ What victory-suiren adds for Linux and speed, in short:
 Upstream's last Windows report (2026-11-24, Windows 11, AMD RX 6700 XT): menus
 at 30 fps, the world drawn at 1-2 s per frame with surfaces unlit.
 
-> **Warning.** Entering the world on a real GPU has hung it in earlier
-> builds, and Windows then resets the display driver (every monitor goes
-> black for a moment). The latest runs did not, but it is not ruled out; a
-> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
-> to reach the world in minutes).
+Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
+
+> **Warning.** Entering the world on a real GPU hung it in earlier builds,
+> and Windows then reset the display driver (every monitor goes black for a
+> moment). The latest runs, several minutes each in the world, did not, but
+> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
+> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
+> adapter instead (too slow to reach the world in minutes).
 
 What each part does today and what it still needs:
 
@@ -86,7 +88,7 @@ What each part does today and what it still needs:
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s on Windows (upstream's report), 0.4-0.5 s under Wine on the test system; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
 ## Getting started
 
@@ -103,10 +105,11 @@ repository then fetches the pinned toolchain. Building needs the MSVC C++
 build tools: Visual Studio or its Build Tools with the "Desktop development
 with C++" workload.
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+A run in the world takes about 33 GB of Windows commit (RAM plus paging
+file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
+and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
+Performance → Memory**. If `crashes.log` reports Windows error 1455, close
+other applications or increase the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -129,10 +132,17 @@ translator) translates every shader the title can ask for into the cache
 they are translated at first use, and their draws wait. With `--pipelines`
 it then makes every pipeline in the title's shader pack (inside
 `shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
+estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
+translator change that touches most programs, which is hours), so a run
 compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made.
+early, it keeps what it made. Without it, a run makes the pipelines it needs
+on worker threads and keeps them, so the first runs after a translator
+change are slower and show missing draws for a while.
+
+To get into the game, press A (Enter) on each first-boot screen and again on
+the start screen. Loading the world takes about a minute; the intro cutscene
+plays, then the prologue starts.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
@@ -229,7 +239,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
+| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |

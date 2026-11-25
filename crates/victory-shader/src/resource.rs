@@ -996,6 +996,25 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || self.joined_on_taken_edges(hi) == Some(want)
+    }
+
+    /// What phi `t` holds in every lane that reads it: the one value its
+    /// args bring along the edges some lane takes (a register set inside a
+    /// region that only a skip no lane takes bypasses, as
+    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
+    fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
+        let Term::Value(v) = t else { return None };
+        let (b, i) = self.phis[v.0 as usize]?;
+        let block = &self.p.blocks[b];
+        let mut taken = block.phis[i]
+            .args
+            .iter()
+            .zip(&block.preds)
+            .filter(|&(_, &q)| self.edge_taken(q, b))
+            .map(|(&a, _)| self.origin(a));
+        let first = taken.next()?;
+        taken.all(|x| x == first).then_some(first)
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1207,58 +1226,31 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let edges: Vec<Vec<Term>> = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect()
-            })
-            .collect();
-        let mut args: Vec<Result<Source, &'static str>> =
-            edges.iter().map(|edge| self.classify(edge, joins, known)).collect();
-        joins.pop();
-        // An edge where the words are registers no root parameter fills
-        // (what the last wave left: a load the branch skipped, as
-        // `s_cbranch_execz` past a block whose lanes are all off does) has
-        // no descriptor the program relies on: it takes another edge's.
-        let stale = |edge: &[Term]| {
-            edge.iter().all(|w| {
-                matches!(*w, Term::Value(v)
-                    if self.inputs.get(v.0 as usize).copied().flatten()
-                        .is_some_and(|r| self.param_of(r).is_none()))
-            })
+        let preds = &self.p.blocks[block].preds;
+        // An edge no lane takes (a skip only helper lanes would take, say)
+        // brings nothing a lane reads: it takes a taken edge's source, and
+        // lowering joins no value there (`never_taken`).
+        let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+        let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
+            let edge: Vec<Term> = words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect();
+            self.classify(&edge, joins, known)
         };
-        if let Some(good) = args.iter().find_map(|a| a.as_ref().ok()).cloned() {
-            for (arg, edge) in args.iter_mut().zip(&edges) {
-                if arg.is_err() && stale(edge) {
-                    *arg = Ok(good.clone());
-                }
-            }
-        }
-        match args.into_iter().collect::<Result<_, _>>() {
-            Ok(args) => Ok(Some(Source::Phi { block, args })),
-            // An edge holds no descriptor. With only one edge the lanes
-            // that read the descriptor can have come by, it is what the
-            // registers hold on that one (a wave that took another edge
-            // has no lane left that reads it), if that can be named where
-            // it is read.
-            Err(e) => {
-                let Some(j) = self.only_edge(block, known) else {
-                    return Err(e);
-                };
-                joins.push(block);
-                let source = self.classify(&edges[j], joins, known);
-                joins.pop();
-                match source {
-                    Ok(source) if self.anywhere(&source) => Ok(Some(source)),
-                    _ => Err(e),
-                }
-            }
-        }
+        let args = match taken.iter().position(|&t| t) {
+            Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
+                (0..preds.len())
+                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                    .collect::<Result<_, _>>()
+            }),
+            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+        };
+        joins.pop();
+        Ok(Some(Source::Phi { block, args: args? }))
     }
 
     /// The one edge into the join `block` that lanes satisfying `known`
@@ -1301,31 +1293,6 @@ impl<'a> Tracer<'a> {
         only
     }
 
-    /// Whether lowering can make a handle for `source` in any block: its
-    /// heap index comes from root parameters and constants alone (a table
-    /// offset the code computes exists only where the load is).
-    fn anywhere(&self, source: &Source) -> bool {
-        match source {
-            Source::Constant(_) => true,
-            Source::Built { address, .. } => address.dynamic.is_none(),
-            Source::Loaded { load, .. } => {
-                let inst = self.inst(*load);
-                match &inst.fields {
-                    Fields::Smem {
-                        base,
-                        offset,
-                        soffset,
-                        ..
-                    } => self
-                        .smem_address(inst, base, *offset, soffset)
-                        .is_ok_and(|a| a.dynamic.is_none()),
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
-    }
-
     /// `t` as the lanes that reach the access being traced hold it: through
     /// joins they can have entered by one edge only ([`Self::only_edge`]).
     fn live(&self, mut t: Term) -> Term {
@@ -1344,6 +1311,26 @@ impl<'a> Tracer<'a> {
             t = self.origin(self.p.blocks[block].phis[i].args[j]);
         }
         t
+    }
+
+    /// Whether some lane goes from block `q` to `b` (true without the
+    /// lanes' paths): `Lower::never_taken`'s test.
+    fn edge_taken(&self, q: usize, b: usize) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let mut edge = vec![(lanes.reach[q], true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        // The very test lowering makes, so both drop the same edges.
+        lanes.bools.meet(&edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

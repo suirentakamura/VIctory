@@ -3,7 +3,7 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
 
-use crate::fast::Map as HashMap;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -17,14 +17,14 @@ pub(crate) enum C {
     Skipped,
     SkippedBytes,
     Runs,
-    RunNs,
+    RunUs,
     Queries,
-    QueryNs,
-    MoveNs,
+    QueryUs,
+    MoveUs,
     Unmapped,
     /// Write-watch askings and their time.
     Watches,
-    WatchNs,
+    WatchUs,
     /// Bytes of watched ranges checked, and of those found unchanged.
     Checked,
     Unchanged,
@@ -40,15 +40,15 @@ pub(crate) enum C {
     /// Time in the kernel's write-watch answers, in the view check of the
     /// guard, in protecting; bytes and time of copies of memory neither
     /// watched nor guarded (copied whole).
-    KernelNs,
-    ViewQueryNs,
-    ProtectNs,
+    KernelUs,
+    ViewQueryUs,
+    ProtectUs,
     WholeBytes,
-    WholeNs,
+    WholeUs,
     /// Snapshots of ranges shaders write (bytes, time); page faults while
     /// preparing submissions and while copying back.
     SnapshotBytes,
-    SnapshotNs,
+    SnapshotUs,
     FaultsPrep,
     FaultsBack,
     /// Pages marked changed because a write landed on another mapping of
@@ -56,7 +56,7 @@ pub(crate) enum C {
     AliasMarks,
     /// Time in the guard handler; protection changes making pages read-only
     /// (calls, pages) and giving write access back (pages).
-    HandlerNs,
+    HandlerUs,
     ProtectCalls,
     ProtectPages,
     OpenPages,
@@ -66,52 +66,46 @@ pub(crate) enum C {
     WrittenAgain,
     /// In change checks: time asking the runtime for other mappings, and
     /// waiting for the guard lock.
-    AliasNs,
-    GuardWaitNs,
+    AliasUs,
+    GuardWaitUs,
     /// Preparing submissions: refresh batches done (copies and change
     /// checks); time in each kind of step (a step that flushes the batch
     /// counts that too); texture uploads for heaps; state preludes.
-    FlushNs,
-    StepRefreshNs,
-    StepCopyNs,
-    StepWorkNs,
-    StepGpuWriteNs,
-    StepTextureNs,
-    StepHeapNs,
-    StepMemoryNs,
-    UploadsNs,
-    PreludeNs,
+    FlushUs,
+    StepRefreshUs,
+    StepCopyUs,
+    StepWorkUs,
+    StepGpuWriteUs,
+    StepTextureUs,
+    StepHeapUs,
+    StepMemoryUs,
+    UploadsUs,
+    PreludeUs,
     /// Copying back: bytes of copies compared with their snapshots, and
     /// the time.
     CompareBytes,
-    CompareNs,
+    CompareUs,
     /// Copying back pages shaders marked as written through views: pages
     /// compared, bytes written back, the time; pages that kept the title's
     /// bytes (it wrote them, their bytes from before unknown); pages whose
     /// bytes the title's first write saved.
     MarkedPages,
     MarkedBytes,
-    MarkedNs,
+    MarkedUs,
     MarkedKept,
     SavedPages,
-    /// Marked pages put back that the title wrote while they were open
-    /// (found changed after all).
-    MarkedRaced,
-    /// Preparing: the pass over descriptor heap pages the title wrote
-    /// (time, slots looked at); the batch of refreshes before the hand-over
-    /// (time); waiting for the copy-back of the submission before to let
-    /// title memory be read (time); heaps whose ranges a batch had already.
-    SyncHeapsNs,
+    /// Preparing submissions: descriptors the title copied into its heaps
+    /// as bytes, made on the host first.
+    SyncHeapsUs,
+    /// Of those: heap slots looked at (every slot of each page written).
     SyncSlots,
-    /// Of those, slots sent to be made again (changed or cleared).
-    SyncMade,
-    LastFlushNs,
-    CopiesWaitNs,
-    HeapsKnown,
-    /// Submissions queued behind another one (the GPU gated on its finish).
-    Gated,
+    /// Time in copies redone piece by piece after meeting an unmapped page.
+    FallbackUs,
+    /// Title threads writing a view into a shader-visible heap: time
+    /// waiting for the heaps' lock (held by heap syncs and other writers).
+    MirrorWaitUs,
 }
-const COUNTERS: usize = C::Gated as usize + 1;
+const COUNTERS: usize = 61;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -136,7 +130,7 @@ static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
-        .get_or_insert_with(HashMap::default)
+        .get_or_insert_with(HashMap::new)
         .entry((src, len))
         .or_insert((0, 0, 0, kind));
     e.0 += 1;
@@ -152,7 +146,7 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
     *SNAPSHOTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::default)
+        .get_or_insert_with(HashMap::new)
         .entry((start, len))
         .or_default() += bytes;
 }
@@ -228,22 +222,20 @@ pub(crate) fn log(frames: f64) {
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
     let mb = |v: f64| v / 1e6;
-    // Times are in nanoseconds.
-    let ms = |v: f64| v / 1e6;
+    let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks ({:.1} ms); {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
          guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
          {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved, {:.0} written by the title meanwhile; \
-         descriptor heap pass {:.1} ms over {:.0} slots ({:.0} made again); last refresh batch {:.1} ms; waiting for the copy-back before {:.1} ms; \
-         {:.0} heap passes already in their batch; {:.1} submissions queued behind another; working set {:.0} MB, {:.0} hard faults",
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -252,64 +244,60 @@ pub(crate) fn log(frames: f64) {
         c[C::Skipped as usize],
         mb(c[C::SkippedBytes as usize]),
         c[C::Runs as usize],
-        ms(c[C::RunNs as usize]),
+        ms(c[C::RunUs as usize]),
         c[C::Queries as usize],
-        ms(c[C::QueryNs as usize]),
-        ms(c[C::MoveNs as usize]),
+        ms(c[C::QueryUs as usize]),
+        ms(c[C::MoveUs as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
-        ms(c[C::WatchNs as usize]),
+        ms(c[C::WatchUs as usize]),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        ms(c[C::FallbackUs as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-        ms(c[C::KernelNs as usize]),
-        ms(c[C::ViewQueryNs as usize]),
-        ms(c[C::ProtectNs as usize]),
+        ms(c[C::KernelUs as usize]),
+        ms(c[C::ViewQueryUs as usize]),
+        ms(c[C::ProtectUs as usize]),
         mb(c[C::WholeBytes as usize]),
-        ms(c[C::WholeNs as usize]),
+        ms(c[C::WholeUs as usize]),
         mb(c[C::SnapshotBytes as usize]),
-        ms(c[C::SnapshotNs as usize]),
+        ms(c[C::SnapshotUs as usize]),
         c[C::FaultsPrep as usize],
         c[C::FaultsBack as usize],
         c[C::AliasMarks as usize],
-        ms(c[C::HandlerNs as usize]),
+        ms(c[C::HandlerUs as usize]),
         c[C::ProtectCalls as usize],
         c[C::ProtectPages as usize],
         c[C::OpenPages as usize],
         c[C::WrittenPages as usize],
         c[C::WrittenAgain as usize],
-        ms(c[C::AliasNs as usize]),
-        ms(c[C::GuardWaitNs as usize]),
-        ms(c[C::FlushNs as usize]),
-        ms(c[C::StepRefreshNs as usize]),
-        ms(c[C::StepCopyNs as usize]),
-        ms(c[C::StepWorkNs as usize]),
-        ms(c[C::StepGpuWriteNs as usize]),
-        ms(c[C::StepTextureNs as usize]),
-        ms(c[C::StepHeapNs as usize]),
-        ms(c[C::StepMemoryNs as usize]),
-        ms(c[C::UploadsNs as usize]),
-        ms(c[C::PreludeNs as usize]),
+        ms(c[C::AliasUs as usize]),
+        ms(c[C::GuardWaitUs as usize]),
+        ms(c[C::FlushUs as usize]),
+        ms(c[C::StepRefreshUs as usize]),
+        ms(c[C::StepCopyUs as usize]),
+        ms(c[C::StepWorkUs as usize]),
+        ms(c[C::StepGpuWriteUs as usize]),
+        ms(c[C::StepTextureUs as usize]),
+        ms(c[C::StepHeapUs as usize]),
+        ms(c[C::StepMemoryUs as usize]),
+        ms(c[C::UploadsUs as usize]),
+        ms(c[C::PreludeUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncSlots as usize],
+        ms(c[C::MirrorWaitUs as usize]),
         mb(c[C::CompareBytes as usize]),
-        ms(c[C::CompareNs as usize]),
+        ms(c[C::CompareUs as usize]),
         c[C::MarkedPages as usize],
         mb(c[C::MarkedBytes as usize]),
-        ms(c[C::MarkedNs as usize]),
+        ms(c[C::MarkedUs as usize]),
         c[C::MarkedKept as usize],
         c[C::SavedPages as usize],
-        c[C::MarkedRaced as usize],
-        ms(c[C::SyncHeapsNs as usize]),
-        c[C::SyncSlots as usize],
-        c[C::SyncMade as usize],
-        ms(c[C::LastFlushNs as usize]),
-        ms(c[C::CopiesWaitNs as usize]),
-        c[C::HeapsKnown as usize],
-        c[C::Gated as usize],
         working_set() as f64 / 1e6,
         {
             static HARD: AtomicU64 = AtomicU64::new(0);
@@ -347,5 +335,85 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+/// A global allocator that counts the bytes Rust code holds (the
+/// statistics' "our heap"; the binary installs it in diagnostics builds).
+pub struct CountingAlloc;
+
+/// Bytes [`CountingAlloc`] has handed out and not taken back.
+pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Allocations of at least this many bytes name their caller, once per
+/// power-of-two size class (who holds the big blocks of our heap).
+const LARGE: usize = 32 << 20;
+
+/// Logs the stack of a large allocation of `size` bytes, the first of its
+/// size class.
+fn note_large(size: usize) {
+    static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    std::thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    let class = 1u64 << size.ilog2().min(63);
+    if INSIDE.with(|i| i.replace(true)) {
+        return;
+    }
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *seen & class == 0;
+        *seen |= class;
+        first
+    };
+    if first {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
+        tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
+    }
+    INSIDE.with(|i| i.set(false));
+}
+
+// SAFETY: every call goes to the system allocator unchanged; only counted.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's layout, passed on.
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: as above.
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+        // SAFETY: a block this allocator handed out with this layout.
+        unsafe { std::alloc::System.dealloc(p, layout) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // SAFETY: as above.
+        let q = unsafe { std::alloc::System.realloc(p, layout, size) };
+        if !q.is_null() {
+            HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+            HEAP_BYTES.fetch_add(size as u64, Relaxed);
+            if size >= LARGE {
+                note_large(size);
+            }
+        }
+        q
     }
 }

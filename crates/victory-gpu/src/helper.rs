@@ -30,10 +30,25 @@ fn text(blob: &ID3DBlob) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// A root view after the constants: a read-only (`Srv`) or writable (`Uav`)
+/// buffer at the given shader register.
+#[derive(Clone, Copy)]
+pub(crate) enum Slot {
+    Srv(u32),
+    Uav(u32),
+}
+
 /// The `main` of `source` as a 5.1 compute shader, with root parameter 0
 /// `constants` 32-bit constants at `b0` and parameters 1.. root unordered
 /// views `u0`.. (`uavs` of them).
 pub(crate) fn compute(name: PCSTR, source: &str, constants: u32, uavs: u32) -> windows::core::Result<Compute> {
+    let slots: Vec<Slot> = (0..uavs).map(Slot::Uav).collect();
+    compute_with(name, source, constants, &slots)
+}
+
+/// As [`compute`], with root parameters 1.. the root views `slots` name, in
+/// that order.
+pub(crate) fn compute_with(name: PCSTR, source: &str, constants: u32, slots: &[Slot]) -> windows::core::Result<Compute> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -69,12 +84,18 @@ pub(crate) fn compute(name: PCSTR, source: &str, constants: u32, uavs: u32) -> w
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     }];
-    params.extend((0..uavs).map(|u| D3D12_ROOT_PARAMETER {
-        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
-        Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: u, RegisterSpace: 0 },
-        },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    params.extend(slots.iter().map(|slot| {
+        let (kind, register) = match *slot {
+            Slot::Srv(r) => (D3D12_ROOT_PARAMETER_TYPE_SRV, r),
+            Slot::Uav(r) => (D3D12_ROOT_PARAMETER_TYPE_UAV, r),
+        };
+        D3D12_ROOT_PARAMETER {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }
     }));
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,

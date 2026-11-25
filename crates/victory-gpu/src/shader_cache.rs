@@ -73,38 +73,15 @@ const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
 fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(&[u8::from(victory_shader::emit::loop_report())]);
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
-/// Programs by the id they report stopped loops under
-/// (`victory_shader::emit::loop_report_id`): their hash as the log names it.
-#[cfg(feature = "diagnostics")]
-fn report_names() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u32, String>> {
-    static NAMES: std::sync::Mutex<std::collections::BTreeMap<u32, String>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-    NAMES.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The hash of the program that reports stopped loops under `id`.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn report_name(id: u32) -> Option<String> {
-    report_names().get(&id).cloned()
-}
-
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    #[cfg(feature = "diagnostics")]
-    if victory_shader::emit::loop_report() {
-        report_names().insert(
-            victory_shader::emit::loop_report_id(container),
-            blake3::hash(container).to_hex()[..16].to_owned(),
-        );
-    }
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };

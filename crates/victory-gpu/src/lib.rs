@@ -20,8 +20,6 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
-mod clock;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -32,10 +30,9 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
-#[cfg(windows)]
-mod fast;
 pub mod fence;
 pub mod frame;
+mod hold;
 #[cfg(windows)]
 mod helper;
 #[cfg(windows)]
@@ -48,7 +45,7 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod pool;
+mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -72,6 +69,8 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
